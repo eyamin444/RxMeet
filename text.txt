@@ -1,0 +1,108 @@
+.\.venv\Scripts\activate.bat
+flutter pub run pdfx:install_web
+flutter run -d chrome
+uvicorn app:app --reload
+uvicorn app:app --host 0.0.0.0 --port 8000
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1 --limit-concurrency 100
+
+adb devices
+adb reverse tcp:8080 tcp:8080
+
+adb reverse tcp:8000 tcp:8000
+flutter run -d RZCRB069HYW --dart-define=API_BASE_URL=http://127.0.0.1:8000
+ ipconfig | findstr /R "IPv4"
+flutter run -d RZCRB069HYW --dart-define=API_BASE_URL=http://192.168.0.101:8000
+
+setx GRADLE_USER_HOME "D:\GradleCache"
+echo $env:GRADLE_USER_HOME
+cd android
+.\gradlew.bat --stop
+cd ..
+flutter clean
+flutter pub get
+
+New-Item -ItemType Directory -Force -Path .\assets\fonts
+
+
+Patient Functions: 
+• Register/Login using email/phone. ✔️
+• Search doctors by disease keywords or category. ✔️
+• View doctor profiles with ratings and backgrounds. 
+• Book appointments based on available slots. 
+• Upload/download prescriptions and medical reports. 
+• Receive push notifications (reminders, confirmations). 
+• Make payment to confirm appointments. 
+update profile(add medical history,Upload prescriptions and medical reports etc)
+
+Doctor Functions: 
+• Registered by the admin. ✔️
+ 
+• Define availability (days, time slots, number of patients). ✔️
+• View approved appointments. 
+• Access patient medical history. 
+• Upload or capture prescriptions digitally. 
+update profile
+
+Admin Functions: 
+• Approve patient appointment requests. ✔️
+• Monitor suspicious activity (fake profiles). ✔️
+• Register and manage doctor accounts.✔️
+upload medical reports
+
+
+Users (admin/doctor/patient) have photos
+
+Patient profile & medical history (age, weight, height, blood group, gender, description, current meds, medical history, previous appointment history auto-derives, previous reports auto-included)
+
+Medical reports (patient & admin can upload)
+
+Prescriptions (text + optional file) — doctor and patient can attach to an appointment
+
+Appointments: date/time, online/offline, patient problem text, optional disease photo, video room token
+
+Payments (id/appointment_id/transaction_id/method/amount/paid_at/status, etc.)
+
+Doctor ratings (patient can rate once per approved appt; average rating updates on doctor)
+
+Doctor documents (certificates etc.) and education (degree, institute, year)
+
+Availability and slots
+
+Admin: register/manage doctors, approve/reject appts, suspicious accounts
+
+
+Set-Location D:\SmartGateway\smart_gateway_app\lib
+
+$URL  = "http://127.0.0.1:8000/admin/doctors"
+$HEAD = @{
+  "accept"        = "application/json"
+  "Authorization" = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI1Iiwicm9sZSI6ImFkbWluIiwiZXhwIjoxNzYxNDM5OTUzfQ.IZjchw-68B3iA8LAqqTQfHHzMmZaVtUHlAdaBWHV8DI"
+  "Content-Type"  = "application/json"
+}
+$PASS = "Doc@12345"
+
+$rows = Import-Csv .\doctor.csv
+foreach ($r in $rows) {
+  $body = @{
+    name       = $r.name
+    email      = $r.email
+    password   = $PASS
+    phone      = $r.phone
+    specialty  = $r.specialty
+    category   = $r.category
+    keywords   = $r.keywords
+    bio        = $r.bio
+    background = $r.background
+  } | ConvertTo-Json
+
+  try {
+    $res = Invoke-RestMethod -Method POST -Uri $URL -Headers $HEAD -Body $body
+    Write-Host "OK -> id=$($res.id) name=$($res.name)"
+  } catch {
+    Write-Warning "FAIL -> $($r.email) :: $($_.Exception.Message)"
+    if ($_.Exception.Response) {
+      $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+      Write-Warning ($reader.ReadToEnd())
+    }
+  }
+}

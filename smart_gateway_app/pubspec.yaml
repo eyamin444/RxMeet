@@ -1,0 +1,49 @@
+name: smart_gateway_app
+description: Smart Gateway — Doctors Appointment Platform
+publish_to: "none"
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.9.0
+  intl: ^0.19.0
+  shared_preferences: ^2.2.2
+  collection: ^1.18.0
+  file_picker: ^8.1.2
+  url_launcher: ^6.3.2
+  screenshot: ^2.1.0
+  pdf: ^3.10.8
+  printing: ^5.14.2
+  path_provider: ^2.1.5
+  share_plus: ^12.0.1
+  flutter_local_notifications: ^19.5.0
+  flutter_timezone: ^5.0.0
+  file_saver: ^0.3.1 
+  pdfx: ^2.5.0
+  livekit_client: ^2.5.3
+  http: ^1.2.2
+  permission_handler: ^11.3.1
+  flutter_webrtc: ^1.2.0
+
+dev_dependencies:
+  http: ^1.1.0
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/fonts/DejaVuSans.ttf
+    - assets/fonts/DejaVuSans-Bold.ttf
+    - assets/fonts/DejaVuSansMono.ttf
+    - assets/fonts/NotoEmoji-Regular.ttf
+
+    # - assets/fonts/Inconsolata_Condensed-Regular.ttf
+    # - assets/fonts/Inconsolata_Condensed-Bold.ttf
+    # - assets/fonts/NotoEmoji-Regular.ttf
+    # - assets/fonts/DejaVuSans.ttf
+    # - assets/fonts/NotoSansSymbols2-Regular.ttf

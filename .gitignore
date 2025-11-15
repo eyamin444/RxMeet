@@ -1,0 +1,46 @@
+# IDE & editor
+.idea/
+.vscode/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Envs
+.env
+.env/
+venv/
+.venv/
+
+# Databases / local state
+*.db
+*.sqlite3
+
+# Logs & temp
+*.log
+*.tmp
+
+# Uploads / generated artifacts
+uploads/
+app.zip
+
+# OS noise
+Thumbs.db
+.DS_Store
+# Android / Gradle
+smart_gateway_app/.gradle/
+smart_gateway_app/.gradle-user/
+smart_gateway_app/.idea/
+smart_gateway_app/.cxx/
+smart_gateway_app/**/build/
+smart_gateway_app/**/.gradle/
+smart_gateway_app/**/.gradle-user/
+
+# General Gradle
+.gradle/
+.gradle-user/
+**/.gradle/
+**/.gradle-user/
+**/build/
