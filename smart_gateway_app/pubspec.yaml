@@ -27,6 +27,9 @@ dependencies:
   http: ^1.2.2
   permission_handler: ^11.3.1
   flutter_webrtc: ^1.2.0
+  wakelock_plus: ^1.2.5
+  firebase_core: ^2.10.0
+  firebase_messaging: ^14.5.0
 
 dev_dependencies:
   http: ^1.1.0

@@ -1,227 +1,358 @@
-// lib/screens/video/video_screen.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:livekit_client/livekit_client.dart' as lk;
-import 'package:smart_gateway_app/services/api.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+
+import '../../Services/Api.dart';
+import '../../services/notification_center.dart';
 
 class VideoScreen extends StatefulWidget {
   final int appointmentId;
-  const VideoScreen({super.key, required this.appointmentId});
+  final bool isDoctor;
+
+  const VideoScreen({
+    super.key,
+    required this.appointmentId,
+    required this.isDoctor,
+  });
 
   @override
   State<VideoScreen> createState() => _VideoScreenState();
 }
 
 class _VideoScreenState extends State<VideoScreen> {
-  late Future<Map<String, dynamic>> _future;
-  bool _joining = false;
+  Future<Map<String, dynamic>>? _future;
+  lk.Room? _room;
+
+  Timer? _callTimer;
+  Timer? _participantWatcher;
+
+  Duration _callDuration = Duration.zero;
+
+  /// online flags
+  bool doctorOnline = false;
+  bool patientOnline = false;
+
+  bool _timerStarted = false;
+
+  double pipTop = 24;
+  double pipRight = 16;
 
   @override
   void initState() {
     super.initState();
-    // Backend should mint LiveKit token + URL for this appointment.
-    _future = Api.joinVideo(widget.appointmentId);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Video visit')),
-      body: FutureBuilder<Map<String, dynamic>>(
-        future: _future,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (snapshot.hasError) {
-            return Center(child: Text('Error: ${snapshot.error}'));
-          }
-
-          final data = snapshot.data ?? const <String, dynamic>{};
-          final ok = data['ok'] == true;
-          if (!ok) {
-            return const Center(child: Text('Unable to mint video token'));
-          }
-
-          final url = (data['url'] ?? '').toString();
-          final roomName = (data['room'] ?? '').toString();
-          final who = (data['display_name'] ?? '').toString();
-          final token = (data['token'] ?? '').toString();
-
-          if (url.isEmpty || token.isEmpty) {
-            return const Center(child: Text('Invalid video configuration'));
-          }
-
-          return Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Ready to join',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 12),
-                Text('Server: $url'),
-                Text('Room:   $roomName'),
-                Text('User:   $who'),
-                const Spacer(),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    icon: _joining
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.videocam_outlined),
-                    label: Text(_joining ? 'Joining…' : 'Join room'),
-                    onPressed: _joining
-                        ? null
-                        : () async {
-                            setState(() => _joining = true);
-                            try {
-                              final room = lk.Room(
-                                roomOptions: const lk.RoomOptions(
-                                  defaultCameraCaptureOptions:
-                                      lk.CameraCaptureOptions(),
-                                  defaultAudioCaptureOptions:
-                                      lk.AudioCaptureOptions(),
-                                ),
-                              );
-
-                              await room.connect(url, token);
-
-                              if (!mounted) return;
-
-                              await Navigator.of(context).push(
-                                MaterialPageRoute(
-                                  builder: (_) => _LiveKitCallPage(
-                                    room: room,
-                                    roomName: roomName,
-                                  ),
-                                ),
-                              );
-                            } catch (e) {
-                              if (!mounted) return;
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content:
-                                      Text('Failed to join LiveKit room: $e'),
-                                ),
-                              );
-                            } finally {
-                              if (mounted) {
-                                setState(() => _joining = false);
-                              }
-                            }
-                          },
-                  ),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
-}
-
-class _LiveKitCallPage extends StatefulWidget {
-  const _LiveKitCallPage({
-    super.key,
-    required this.room,
-    this.roomName,
-  });
-
-  final lk.Room room;
-  final String? roomName;
-
-  @override
-  State<_LiveKitCallPage> createState() => _LiveKitCallPageState();
-}
-
-class _LiveKitCallPageState extends State<_LiveKitCallPage> {
-  @override
-  void initState() {
-    super.initState();
-    final lp = widget.room.localParticipant;
-    lp
-      ?..setMicrophoneEnabled(true)
-      ..setCameraEnabled(true);
+    _future = _loadJoinPayload();
+    WakelockPlus.enable();
   }
 
   @override
   void dispose() {
-    widget.room.dispose();
+    _callTimer?.cancel();
+    _participantWatcher?.cancel();
+    _room?.dispose();
+    WakelockPlus.disable();
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final title = (widget.roomName != null &&
-            widget.roomName!.trim().isNotEmpty)
-        ? 'Video — ${widget.roomName}'
-        : 'Video call';
+  Future<Map<String, dynamic>> _loadJoinPayload() async {
+    if (!Api.isReady) await Api.init();
+    return Api.joinVideo(widget.appointmentId);
+  }
 
-    return Scaffold(
-      appBar: AppBar(title: Text(title)),
-      body: Column(
-        children: [
-          const Expanded(
-            child: Center(
-              // Later you can replace this with LiveKit video widgets.
-              child: Text('Connected to LiveKit room'),
-            ),
-          ),
-          _CallControls(room: widget.room),
-        ],
+  // ---------------- TIMER ----------------
+  void _startCallTimerOnce() {
+    if (_timerStarted) return;
+    _timerStarted = true;
+
+    _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {
+        _callDuration += const Duration(seconds: 1);
+      });
+    });
+  }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes.toString().padLeft(2, '0');
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  // ---------------- CONNECT ----------------
+  Future<void> _connect(String wsUrl, String token) async {
+    final room = lk.Room(
+      roomOptions: const lk.RoomOptions(
+        adaptiveStream: true,
+        dynacast: true,
       ),
     );
+
+    await room.connect(wsUrl, token);
+    await room.localParticipant?.setCameraEnabled(true);
+    await room.localParticipant?.setMicrophoneEnabled(true);
+
+    _room = room;
+
+    /// mark online state
+    if (widget.isDoctor) {
+      doctorOnline = true;
+
+      /// 🔔 notify patient BEFORE patient joins
+      await NotificationCenter().push(
+        title: 'Doctor is ready',
+        body: 'Your doctor has joined and is waiting for you',
+        type: 'video_ready',
+        appointmentId: widget.appointmentId,
+      );
+    } else {
+      patientOnline = true;
+    }
+
+    _startParticipantWatcher();
+
+    if (mounted) setState(() {});
   }
-}
 
-class _CallControls extends StatelessWidget {
-  const _CallControls({required this.room});
+  // ---------------- PARTICIPANT WATCHER ----------------
+  void _startParticipantWatcher() {
+    _participantWatcher?.cancel();
+    _participantWatcher =
+        Timer.periodic(const Duration(milliseconds: 400), (_) {
+      if (_room == null) return;
 
-  final lk.Room room;
+      final hasRemote = _room!.remoteParticipants.isNotEmpty;
+
+      /// both online → start timer
+      if (hasRemote && !_timerStarted) {
+        _startCallTimerOnce();
+      }
+
+      /// when patient joins, doctor is already online
+      if (!widget.isDoctor && hasRemote && doctorOnline) {
+        patientOnline = true;
+      }
+    });
+  }
+
+  // ---------------- VIDEO TILE ----------------
+  Widget _videoTile(lk.TrackPublication pub, {bool mirror = false}) {
+    final track = pub.track;
+    if (track is! lk.VideoTrack) return const SizedBox();
+
+    return lk.VideoTrackRenderer(
+      track,
+      fit: lk.VideoViewFit.contain,
+      mirrorMode:
+          mirror ? lk.VideoViewMirrorMode.mirror : lk.VideoViewMirrorMode.off,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final lp = room.localParticipant;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: FutureBuilder<Map<String, dynamic>>(
+        future: _future,
+        builder: (context, snap) {
+          if (!snap.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
 
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          IconButton(
-            tooltip: 'Toggle mic',
-            onPressed: () async {
-              final enabled = lp?.isMicrophoneEnabled() ?? false;
-              await lp?.setMicrophoneEnabled(!enabled);
-            },
-            icon: const Icon(Icons.mic_none),
-          ),
-          const SizedBox(width: 12),
-          IconButton(
-            tooltip: 'Toggle camera',
-            onPressed: () async {
-              final enabled = lp?.isCameraEnabled() ?? false;
-              await lp?.setCameraEnabled(!enabled);
-            },
-            icon: const Icon(Icons.videocam_outlined),
-          ),
-          const SizedBox(width: 12),
-          FilledButton.icon(
-            onPressed: () async {
-              await room.disconnect();
-              if (context.mounted) Navigator.pop(context);
-            },
-            icon: const Icon(Icons.call_end),
-            label: const Text('Leave'),
-          ),
-        ],
+          final data = snap.data!;
+          if (data['ok'] != true) {
+            return const Center(child: Text('Unable to join call'));
+          }
+
+          final wsUrl = data['url'] as String;
+          final token = data['token'] as String;
+
+          // ================= PRE JOIN =================
+          if (_room == null) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      widget.isDoctor
+                          ? 'Start Video Consultation'
+                          : doctorOnline
+                              ? 'Doctor is ready'
+                              : 'Waiting for Doctor',
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    if (!widget.isDoctor && doctorOnline)
+                      const Text(
+                        'Your doctor is already online',
+                        style: TextStyle(color: Colors.greenAccent),
+                      ),
+                    const SizedBox(height: 24),
+                    ElevatedButton.icon(
+                      onPressed: () => _connect(wsUrl, token),
+                      icon: const Icon(Icons.video_call),
+                      label: const Text('Join Video Call'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextButton.icon(
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.arrow_back),
+                      label: const Text('Back'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
+
+          // ================= IN CALL =================
+          lk.TrackPublication? remoteVideo;
+          for (final p in _room!.remoteParticipants.values) {
+            for (final pub in p.videoTrackPublications) {
+              if (pub.subscribed) {
+                remoteVideo = pub;
+                break;
+              }
+            }
+          }
+
+          lk.TrackPublication? localVideo;
+          final lp = _room!.localParticipant;
+          if (lp != null) {
+            for (final pub in lp.videoTrackPublications) {
+              if (!pub.muted) localVideo = pub;
+            }
+          }
+
+          return Stack(
+            children: [
+              Positioned.fill(
+                child: remoteVideo == null
+                    ? const Center(
+                        child: Text(
+                          'Waiting for participant…',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      )
+                    : _videoTile(remoteVideo),
+              ),
+
+              // timer
+              Positioned(
+                top: 40,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(
+                      _fmt(_callDuration),
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ),
+              ),
+
+              if (localVideo != null)
+                Positioned(
+                  top: pipTop,
+                  right: pipRight,
+                  width: 140,
+                  height: 200,
+                  child: GestureDetector(
+                    onPanUpdate: (d) {
+                      setState(() {
+                        pipTop += d.delta.dy;
+                        pipRight -= d.delta.dx;
+                      });
+                    },
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          border:
+                              Border.all(color: Colors.white, width: 2),
+                        ),
+                        child: _videoTile(localVideo, mirror: true),
+                      ),
+                    ),
+                  ),
+                ),
+
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: SafeArea(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    color: Colors.black54,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        IconButton(
+                          icon: Icon(
+                            _room!.localParticipant!.isMicrophoneEnabled()
+                                ? Icons.mic
+                                : Icons.mic_off,
+                            color: Colors.white,
+                          ),
+                          onPressed: () async {
+                            final lp = _room!.localParticipant!;
+                            await lp.setMicrophoneEnabled(
+                                !lp.isMicrophoneEnabled());
+                            setState(() {});
+                          },
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            _room!.localParticipant!.isCameraEnabled()
+                                ? Icons.videocam
+                                : Icons.videocam_off,
+                            color: Colors.white,
+                          ),
+                          onPressed: () async {
+                            final lp = _room!.localParticipant!;
+                            await lp.setCameraEnabled(
+                                !lp.isCameraEnabled());
+                            setState(() {});
+                          },
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.call_end, color: Colors.red),
+                          onPressed: () async {
+                            _callTimer?.cancel();
+
+                            await NotificationCenter().push(
+                              title: 'Video call ended',
+                              body: 'Duration: ${_fmt(_callDuration)}',
+                              type: 'video_end',
+                              appointmentId: widget.appointmentId,
+                              alsoShowSystemToast: false,
+                            );
+
+                            await _room!.disconnect();
+                            setState(() => _room = null);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

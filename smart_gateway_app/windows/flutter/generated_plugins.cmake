@@ -5,6 +5,7 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   connectivity_plus
   file_saver
+  firebase_core
   flutter_timezone
   flutter_webrtc
   livekit_client

@@ -39,6 +39,7 @@ import '../../models.dart';
 import '../../services/api.dart';
 import '../../services/auth.dart';
 import '../../widgets/snack.dart';
+import '../../screens/video/video_screen.dart';
 import '../../widgets/notification_bell.dart';
 import '../../services/notification_sync.dart';
 import '../payment/payment_screen.dart';
@@ -197,8 +198,8 @@ final GlobalKey<_MyAppointmentsTabState> _apptsKey = GlobalKey<_MyAppointmentsTa
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ===================== FULL DOCTORS TAB (responsive / overflow-safe) =====================
-// ==========================================================================================
+//  FULL DOCTORS TAB (responsive / overflow-safe) 
+// ─────────────────────────────────────────────────────────────────────────────
 
 class BrowseDoctorsTab extends StatefulWidget {
   const BrowseDoctorsTab({super.key});
@@ -2876,7 +2877,8 @@ try {
     }
   }
 
-  bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _videoWindowNow();
+  //bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _videoWindowNow();
+  bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold');
   bool get _canChat  => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _paid && _status == 'approved';
 
   // ---------------- actions ----------------
@@ -3421,34 +3423,42 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                           ),
                         ),
                       ],
+// Online-only live actions
+_isOnline
+    ? Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          FilledButton.icon(
+            onPressed: _canVideo
+                ? () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) =>
+                            VideoScreen(
+                          appointmentId: widget.apptId,
+                          isDoctor: false,
+                        )
+                      ),
+                    )
+                : null,
+            icon: const Icon(Icons.videocam),
+            label: const Text('Video'),
+          ),
+          FilledButton.tonalIcon(
+            onPressed: _canChat
+                ? () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => _ChatPage(apptId: widget.apptId),
+                      ),
+                    )
+                : null,
+            icon: const Icon(Icons.chat_bubble_outline),
+            label: const Text('Chat'),
+          ),
+        ],
+      )
+    : const SizedBox.shrink(),
 
-                      // Online-only live actions
-                      _isOnline
-                          ? Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                FilledButton.icon(
-                                  onPressed: _canVideo && videoUrl.isNotEmpty
-                                      ? () => launchUrl(Uri.parse(videoUrl), mode: LaunchMode.externalApplication)
-                                      : null,
-                                  icon: const Icon(Icons.videocam),
-                                  label: const Text('Video'),
-                                ),
-                                FilledButton.tonalIcon(
-                                  onPressed: _canChat
-                                      ? () => Navigator.of(context).push(
-                                            MaterialPageRoute(builder: (_) => _ChatPage(apptId: widget.apptId)),
-                                          )
-                                      : null,
-                                  icon: const Icon(Icons.chat_bubble_outline),
-                                  label: const Text('Chat'),
-                                ),
-                              ],
-                            )
-                          : const SizedBox.shrink(),
-
-                      const SizedBox(height: 8),
                     ],
                   );
                 },

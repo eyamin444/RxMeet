@@ -3517,6 +3517,7 @@ doc.addPage(
                           MaterialPageRoute(
                             builder: (_) => VideoScreen(
                               appointmentId: widget.apptId,
+                              isDoctor: true,
                             ),
                           ),
                         ),

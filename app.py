@@ -34,10 +34,9 @@ JWT_ALG = os.getenv("JWT_ALG", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "240"))
 HOSPITAL_HOTLINE = os.getenv("HOSPITAL_HOTLINE", "+88000000000")
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "http://localhost:7880")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://192.168.0.102:7880")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
-
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "devsecret_1234567890_1234567890_ABCDEFG")
 
 from sqlalchemy.pool import NullPool, StaticPool
 

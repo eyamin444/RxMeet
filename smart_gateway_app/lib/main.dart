@@ -5,35 +5,43 @@ import 'services/api.dart';
 import 'services/auth.dart';
 import 'models.dart';
 import 'widgets/snack.dart';
+
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/timezone.dart' as tz;
-import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/data/latest.dart' as tzdata;
+
 import 'app_config.dart';
 import 'package:livekit_client/livekit_client.dart' as lk;
-
 
 // Aliases prevent naming clashes
 import 'screens/admin/dashboard.dart' as admin show AdminDashboard;
 import 'screens/doctor/dashboard.dart' as doctor show DoctorDashboard;
 import 'screens/patient/dashboard.dart' as patient show PatientDashboard;
 
-
-final FlutterLocalNotificationsPlugin notifications = FlutterLocalNotificationsPlugin();
+final FlutterLocalNotificationsPlugin notifications =
+    FlutterLocalNotificationsPlugin();
 
 Future<void> initNotifications() async {
   const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
-  await notifications.initialize(const InitializationSettings(android: androidInit));
+  await notifications.initialize(
+    const InitializationSettings(android: androidInit),
+  );
 
-tz.initializeTimeZones();
-final info = await FlutterTimezone.getLocalTimezone(); // TimezoneInfo
-tz.setLocalLocation(tz.getLocation('Asia/Dhaka'));       // <- use .name
+  // ---- Timezone: fixed to Asia/Dhaka ----
+  tzdata.initializeTimeZones();
+  // If you want **always** Asia/Dhaka:
+  tz.setLocalLocation(tz.getLocation('Asia/Dhaka'));
 
+  // If later you want dynamic device TZ instead:
+  // final info = await FlutterTimezone.getLocalTimezone();
+  // tz.setLocalLocation(tz.getLocation(info)); // info is String in latest versions
 
-  final androidImpl = notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  final androidImpl = notifications
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
   await androidImpl?.requestNotificationsPermission();
 }
-
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -42,7 +50,6 @@ void main() async {
   await Api.init(override: AppConfig.apiBaseUrl);
   runApp(const SmartGatewayApp());
 }
-
 
 class SmartGatewayApp extends StatelessWidget {
   const SmartGatewayApp({super.key});
@@ -55,15 +62,11 @@ class SmartGatewayApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         colorSchemeSeed: Colors.teal,
-
-        // ✅ Use Flutter's built-in typography & fonts (Roboto/SF + MaterialIcons)
-        // Do NOT set any custom fontFamily or fontFamilyFallback here.
         typography: Typography.material2021(),
       ),
       home: const _Bootstrap(),
     );
   }
-
 }
 
 class _Bootstrap extends StatefulWidget {
@@ -168,7 +171,10 @@ class _LoginPageState extends State<LoginPage> {
       final pong = await Api.get('/ping');
       if (mounted) showSnack(context, 'API OK: $pong @ ${Api.baseUrl}');
     } catch (e) {
-      if (mounted) showSnack(context, 'API NOT REACHABLE @ ${Api.baseUrl}\n$e');
+      if (mounted) {
+        showSnack(
+            context, 'API NOT REACHABLE @ ${Api.baseUrl}\n$e');
+      }
     }
   }
 
@@ -212,16 +218,30 @@ class _LoginPageState extends State<LoginPage> {
                   ),
                 ),
                 const SizedBox(height: 12),
-               Row(
-                    children: [
-                      Expanded(child: OutlinedButton(onPressed: () => _prefill('admin'), child: const Text('Fill Admin'))),
-                      const SizedBox(width: 8),
-                      Expanded(child: OutlinedButton(onPressed: () => _prefill('doctor'), child: const Text('Fill Doctor'))),
-                      const SizedBox(width: 8),
-                      Expanded(child: OutlinedButton(onPressed: () => _prefill('patient'), child: const Text('Fill Patient'))),
-                    ],
-                  ),
-
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => _prefill('admin'),
+                        child: const Text('Fill Admin'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => _prefill('doctor'),
+                        child: const Text('Fill Doctor'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => _prefill('patient'),
+                        child: const Text('Fill Patient'),
+                      ),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 12),
                 FilledButton(
                   onPressed: busy ? null : _login,
@@ -229,16 +249,19 @@ class _LoginPageState extends State<LoginPage> {
                       ? const SizedBox(
                           width: 18,
                           height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2))
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
                       : const Text('Login'),
                 ),
                 const SizedBox(height: 8),
                 TextButton(
-                    onPressed: () => Navigator.of(context).push(
-                          MaterialPageRoute(
-                              builder: (_) => const RegisterPage()),
-                        ),
-                    child: const Text('Register as Patient')),
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const RegisterPage(),
+                    ),
+                  ),
+                  child: const Text('Register as Patient'),
+                ),
               ]),
             ),
           ),
@@ -272,14 +295,16 @@ class _RegisterPageState extends State<RegisterPage> {
         password: pass.text,
       );
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('Registered! Now login.')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Registered! Now login.')),
+        );
         Navigator.pop(context);
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Register failed: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Register failed: $e')),
+        );
       }
     } finally {
       if (mounted) setState(() => busy = false);
@@ -300,27 +325,37 @@ class _RegisterPageState extends State<RegisterPage> {
               padding: const EdgeInsets.all(16),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 TextField(
-                    controller: name,
-                    decoration: const InputDecoration(
-                        labelText: 'Name', border: OutlineInputBorder())),
+                  controller: name,
+                  decoration: const InputDecoration(
+                    labelText: 'Name',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
                 const SizedBox(height: 12),
                 TextField(
-                    controller: email,
-                    decoration: const InputDecoration(
-                        labelText: 'Email (optional)',
-                        border: OutlineInputBorder())),
+                  controller: email,
+                  decoration: const InputDecoration(
+                    labelText: 'Email (optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
                 const SizedBox(height: 12),
                 TextField(
-                    controller: phone,
-                    decoration: const InputDecoration(
-                        labelText: 'Phone (optional)',
-                        border: OutlineInputBorder())),
+                  controller: phone,
+                  decoration: const InputDecoration(
+                    labelText: 'Phone (optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
                 const SizedBox(height: 12),
                 TextField(
-                    controller: pass,
-                    obscureText: true,
-                    decoration: const InputDecoration(
-                        labelText: 'Password', border: OutlineInputBorder())),
+                  controller: pass,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Password',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
                 const SizedBox(height: 12),
                 FilledButton(
                   onPressed: busy ? null : _register,
@@ -328,9 +363,10 @@ class _RegisterPageState extends State<RegisterPage> {
                       ? const SizedBox(
                           width: 18,
                           height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2))
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
                       : const Text('Create account'),
-                )
+                ),
               ]),
             ),
           ),
@@ -339,5 +375,3 @@ class _RegisterPageState extends State<RegisterPage> {
     );
   }
 }
-
-

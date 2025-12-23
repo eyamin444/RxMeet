@@ -1,21 +1,16 @@
+# livekit.yaml  (D:\SmartGateway\livekit.yaml)
+
+log_level: info
 port: 7880
+
+# livekit.yaml
 
 rtc:
   tcp_port: 7881
   udp_port: 7882
   port_range_start: 50100
   port_range_end: 50120
+  node_ip: 192.168.0.102   # your Windows LAN IP on this machine
 
-  # use the LAN IP of your Windows machine
-  node_ip: 192.168.0.103
-
-  # for local testing, don’t force external/public IPs
-  use_external_ip: true
-
-# remove or comment out the whole `turn:` block for now
-# turn:
-#   ...
-
-# your API key/secret
 keys:
   devkey: devsecret_1234567890_1234567890_ABCDEFG
