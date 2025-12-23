@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "935659627808",
+    "project_id": "rxmeet-3f5b6",
+    "storage_bucket": "rxmeet-3f5b6.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:935659627808:android:c3c66b4a53c5a650eb6345",
+        "android_client_info": {
+          "package_name": "com.example.rxmeet"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD73XWzqEF121lrVlJK-n__ftCnr-gA51M"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
