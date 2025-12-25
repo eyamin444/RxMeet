@@ -1,5 +1,5 @@
 name: smart_gateway_app
-description: Smart Gateway — Doctors Appointment Platform
+description: RxMeet — Doctors Appointment Platform
 publish_to: "none"
 
 environment:
@@ -8,34 +8,44 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+
+  # Core libs
   dio: ^5.9.0
-  intl: ^0.19.0
-  shared_preferences: ^2.2.2
+  intl: ^0.20.2
+  shared_preferences: ^2.5.4
   collection: ^1.18.0
-  file_picker: ^8.1.2
+  file_picker: ^10.3.8
   url_launcher: ^6.3.2
-  screenshot: ^2.1.0
+  screenshot: ^3.0.0
   pdf: ^3.10.8
   printing: ^5.14.2
   path_provider: ^2.1.5
   share_plus: ^12.0.1
   flutter_local_notifications: ^19.5.0
   flutter_timezone: ^5.0.0
-  file_saver: ^0.3.1 
+  file_saver: ^0.3.1
   pdfx: ^2.5.0
   livekit_client: ^2.5.3
   http: ^1.2.2
-  permission_handler: ^11.3.1
+  permission_handler: ^12.0.1
   flutter_webrtc: ^1.2.0
   wakelock_plus: ^1.2.5
-  firebase_core: ^2.10.0
-  firebase_messaging: ^14.5.0
+  audioplayers: 6.5.1
+
+
+  # Firebase (web-compatible versions for Flutter 3.38 / Dart 3.10)
+  firebase_core: ^4.3.0
+  firebase_core_web: ^3.3.1
+  firebase_messaging: ^16.1.0
+  firebase_messaging_web: ^4.1.1
+
+  # JS interop required by firebase_messaging_web
+  js: ^0.7.2
 
 dev_dependencies:
-  http: ^1.1.0
   flutter_test:
     sdk: flutter
-  flutter_lints: ^3.0.1
+  flutter_lints: ^6.0.0
 
 flutter:
   uses-material-design: true
@@ -44,9 +54,5 @@ flutter:
     - assets/fonts/DejaVuSans-Bold.ttf
     - assets/fonts/DejaVuSansMono.ttf
     - assets/fonts/NotoEmoji-Regular.ttf
+    - assets/ringtone/telehealth_incoming_ringtone.wav
 
-    # - assets/fonts/Inconsolata_Condensed-Regular.ttf
-    # - assets/fonts/Inconsolata_Condensed-Bold.ttf
-    # - assets/fonts/NotoEmoji-Regular.ttf
-    # - assets/fonts/DejaVuSans.ttf
-    # - assets/fonts/NotoSansSymbols2-Regular.ttf

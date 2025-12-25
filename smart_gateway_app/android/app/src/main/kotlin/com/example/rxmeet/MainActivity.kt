@@ -1,4 +1,4 @@
-package com.example.smart_gateway_app
+package com.example.rxmeet
 
 import io.flutter.embedding.android.FlutterActivity
 

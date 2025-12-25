@@ -1,7 +1,6 @@
 # app.py
 
 from datetime import datetime, timedelta, date as dt_date, date
-from datetime import timedelta
 from enum import Enum
 import os, secrets
 from typing import Optional, List, Iterable, Tuple
@@ -39,6 +38,20 @@ LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "devsecret_1234567890_1234567890_ABCDEFG")
 
 from sqlalchemy.pool import NullPool, StaticPool
+
+# Firebase Admin for sending FCM from the server
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+FIREBASE_CREDENTIAL_PATH = os.getenv("FIREBASE_CREDENTIAL_PATH")  # set this env var
+if FIREBASE_CREDENTIAL_PATH and not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate(FIREBASE_CREDENTIAL_PATH)
+        firebase_admin.initialize_app(cred)
+        print("Firebase admin initialized")
+    except Exception as e:
+        print("Failed to initialize firebase_admin:", e)
+
 
 def _engine_from_env(url: str):
     if url.startswith("sqlite"):
@@ -304,6 +317,29 @@ class Payment(Base):
     raw = Column(Text, default="")
     appointment = relationship("Appointment", back_populates="payment")
 
+class DeviceToken(Base):
+    __tablename__ = "device_tokens"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token = Column(String, nullable=False, index=True)
+    platform = Column(String, nullable=True)   # 'android' | 'ios' | 'web'
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+class CallLog(Base):
+    __tablename__ = "call_logs"
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False, index=True)
+    started_by_user_id = Column(Integer, nullable=True)   # user id who started (doctor)
+    started_at = Column(DateTime, nullable=True)
+    answered_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+    duration = Column(Integer, nullable=True)  # seconds
+    status = Column(String, default="ringing")  # ringing | answered | ended | missed
+
+
 # -----------------------------------------------------------------------------
 # SQLite additive auto-migrations (adds columns safely)
 # -----------------------------------------------------------------------------
@@ -394,6 +430,43 @@ def create_access_token(data: dict, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) 
     to_encode = data.copy()
     to_encode["exp"] = datetime.utcnow() + timedelta(minutes=minutes)
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
+
+def fcm_send_data_tokens(db: Session, tokens: List[str], data: dict, ttl_seconds: int = 60):
+    """
+    Send a data-only message to a list of device tokens.
+    Removes device tokens which return NotRegistered/Unregistered errors.
+    """
+    if not tokens:
+        return
+    webpush_cfg = None
+    try:
+        webpush_cfg = messaging.WebpushConfig(headers={"Urgency": "high"})
+    except Exception:
+        webpush_cfg = None
+    android_cfg = messaging.AndroidConfig(priority="high", ttl=ttl_seconds)
+
+    for t in list(set(tokens)):
+        try:
+            msg = messaging.Message(
+                data={k: str(v) for k, v in data.items()},
+                token=t,
+                android=android_cfg,
+                webpush=webpush_cfg,
+            )
+            messaging.send(msg)
+        except Exception as e:
+            err = str(e)
+            # Remove tokens that are no longer valid
+            if "Unregistered" in err or "not registered" in err or "registration-token-not-registered" in err:
+                try:
+                    db.query(DeviceToken).filter(DeviceToken.token == t).delete()
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            else:
+                # Log and continue; do not raise to avoid failing the whole call
+                print("FCM send error:", err)
+
 
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> User:
     exc = HTTPException(status_code=401, detail="Could not validate credentials",
@@ -883,6 +956,59 @@ async def update_me(
     db.refresh(current)
     return current
 
+@app.post("/me/device_token", response_model=dict)
+async def register_device_token(request: Request, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    """
+    Accepts JSON { "token": "...", "platform": "web" } OR form fields.
+    Platform should be 'web', 'android', or 'ios' (optional).
+    """
+    token = None
+    platform = None
+
+    # Try JSON first (async)
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            token = body.get("token") or body.get("device_token") or body.get("deviceToken")
+            platform = body.get("platform") or body.get("platformName")
+    except Exception:
+        body = None
+
+    # If not JSON, try form
+    if not token:
+        try:
+            form = await request.form()
+            token = (form.get("token") or form.get("device_token") or form.get("deviceToken"))
+            platform = platform or form.get("platform")
+        except Exception:
+            pass
+
+    # Last fallback: query param
+    if not token:
+        token = request.query_params.get("token") if request.query_params else None
+        platform = platform or (request.query_params.get("platform") if request.query_params else None)
+
+    if not token:
+        raise HTTPException(422, "token is required")
+
+    platform = (platform or "").lower() if platform else None
+    if platform not in ("web", "android", "ios", None):
+        # normalize common values
+        if "web" in platform: platform = "web"
+        elif "android" in platform: platform = "android"
+        elif "ios" in platform or "iphone" in platform or "ipad" in platform: platform = "ios"
+        else:
+            platform = None
+
+    existing = db.query(DeviceToken).filter(DeviceToken.token == token).first()
+    if existing:
+        existing.user_id = current.id
+        existing.platform = platform
+        existing.last_seen_at = datetime.utcnow()
+    else:
+        db.add(DeviceToken(user_id=current.id, token=token, platform=platform))
+    db.commit()
+    return {"ok": True}
 
 # -----------------------------------------------------------------------------
 # Admin
@@ -2103,6 +2229,108 @@ def create_video_room(appointment_id: int, current: User = Depends(get_current_u
         db.commit()
     return {"ok": True, "room": appt.video_room}
 
+@app.post("/appointments/{appointment_id}/call/start", response_model=dict)
+def start_call(appointment_id: int, current: User = Depends(require_role(UserRole.doctor)), db: Session = Depends(get_db)):
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+    if appt.doctor.user_id != current.id:
+        raise HTTPException(403, "Only the doctor can start the video call")
+
+    # Ensure room exists
+    room_name = appt.video_room or f"appt_{appointment_id}"
+    if not appt.video_room:
+        appt.video_room = room_name
+        appt.last_modified_by_user_id = current.id
+        appt.last_modified_at = datetime.utcnow()
+        db.commit()
+
+    # Create call log
+    cl = CallLog(appointment_id=appointment_id, started_by_user_id=current.id, started_at=datetime.utcnow(), status="ringing")
+    db.add(cl); db.commit(); db.refresh(cl)
+
+    # Collect patient device tokens rows (with platform)
+    patient_user_id = appt.patient.user_id if appt.patient else None
+    tokens_rows = []
+    if patient_user_id:
+        tokens_rows = db.query(DeviceToken).filter(DeviceToken.user_id == patient_user_id).all()
+
+    payload = {
+        "type": "doctor_call",
+        "appointment_id": str(appointment_id),
+        "room": room_name,
+        "doctor_name": current.name or "Doctor",
+        "call_log_id": str(cl.id),
+    }
+
+    # Send messages per platform using firebase_admin
+    for tr in tokens_rows:
+        try:
+            if (tr.platform or "").lower() == "web":
+                # Webpush (notification displayed by browser/service worker)
+                webpush = messaging.WebpushConfig(
+                    headers={"Urgency": "high"},
+                    notification=messaging.WebpushNotification(
+                        title=payload["doctor_name"],
+                        body="Incoming video call",
+                    ),
+                    fcm_options=messaging.WebpushFCMOptions(link=f"/"),  # link can be handled by SW click action
+                )
+                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token, webpush=webpush)
+                messaging.send(msg)
+            elif (tr.platform or "").lower() == "android":
+                # Android: include notification so OS shows it (and plays default sound)
+                android_notif = messaging.AndroidNotification(title=payload["doctor_name"], body="Incoming video call", sound="default")
+                android_cfg = messaging.AndroidConfig(priority="high", ttl=60, notification=android_notif)
+                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token, android=android_cfg)
+                messaging.send(msg)
+            elif (tr.platform or "").lower() == "ios":
+                # APNs: attach alert so iOS shows a notification
+                apns_cfg = messaging.APNSConfig(
+                    headers={"apns-priority": "10"},
+                    payload=messaging.APNSPayload(aps=messaging.Aps(alert={'title': payload["doctor_name"], 'body': "Incoming video call"}, sound="default"))
+                )
+                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token, apns=apns_cfg)
+                messaging.send(msg)
+            else:
+                # Unknown platform — send a data message as fallback
+                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token)
+                messaging.send(msg)
+        except Exception as e:
+            err = str(e)
+            # Remove tokens that are no longer valid
+            if "Unregistered" in err or "not registered" in err or "registration-token-not-registered" in err:
+                try:
+                    db.query(DeviceToken).filter(DeviceToken.token == tr.token).delete()
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            else:
+                print("FCM send error:", err)
+
+    return {"ok": True, "call_log_id": cl.id}
+
+@app.post("/appointments/{appointment_id}/call/answer", response_model=dict)
+def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)):
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+    if appt.patient.user_id != current.id:
+        raise HTTPException(403, "Not your appointment")
+
+    cl = db.get(CallLog, call_log_id) if call_log_id else None
+    if cl and cl.appointment_id != appointment_id:
+        raise HTTPException(400, "call log mismatch")
+
+    if not cl:
+        cl = CallLog(appointment_id=appointment_id, started_at=datetime.utcnow())
+
+    cl.answered_at = datetime.utcnow()
+    cl.status = "answered"
+    db.commit()
+    return {"ok": True, "call_log_id": cl.id}
+
+
 @app.post("/appointments/{appointment_id}/video/token", response_model=dict)
 def mint_video_token(
     appointment_id: int,
@@ -3021,6 +3249,7 @@ def prescription_pdf(
     gender = (pat.gender or "") if pat else ""
     doctor_name = appt.doctor.user.name if (appt and appt.doctor and appt.doctor.user) else "Dr."
     doctor_meta = appt.doctor.specialty if (appt and appt.doctor) else ""
+    doc_addr = appt.doctor.address if (appt and appt.doctor) else ""
     appt_dt = appt.start_time or appt.prescription.created_at
     follow_up = data.get("follow_up") or "No date"
     advice = (data.get("advice") or "").replace("\n", " ")
