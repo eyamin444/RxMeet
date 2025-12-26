@@ -44,3 +44,4 @@ smart_gateway_app/**/.gradle-user/
 **/.gradle/
 **/.gradle-user/
 **/build/
+firebase-service-account.json

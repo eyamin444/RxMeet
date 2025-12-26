@@ -1,3 +1,4 @@
+// lib/screens/video/video_screen.dart
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:livekit_client/livekit_client.dart' as lk;
@@ -93,20 +94,29 @@ class _VideoScreenState extends State<VideoScreen> {
 
     _room = room;
 
-    /// mark online state
-    if (widget.isDoctor) {
-      doctorOnline = true;
+   if (widget.isDoctor) {
+  doctorOnline = true;
 
-      /// 🔔 notify patient BEFORE patient joins
-      await NotificationCenter().push(
-        title: 'Doctor is ready',
-        body: 'Your doctor has joined and is waiting for you',
-        type: 'video_ready',
-        appointmentId: widget.appointmentId,
-      );
-    } else {
-      patientOnline = true;
-    }
+  // Tell the backend that the doctor has joined and ask the server to notify
+  // the patient(s). The server should send a data-only FCM with type='doctor_call'
+  // so the patient app will open the IncomingCallPage.
+  try {
+    await Api.post('/appointments/${widget.appointmentId}/call/start', data: {});
+  } catch (e) {
+    // If backend notification fails, fallback to a local notice for the doctor only.
+    // (This keeps doctor informed but won't disturb patient flow.)
+    print('Failed to notify backend to start call: $e');
+    await NotificationCenter().push(
+      title: 'Doctor is ready (local)',
+      body: 'Doctor is ready, but notifying patient failed.',
+      type: 'video_ready',
+      appointmentId: widget.appointmentId,
+    );
+  }
+} else {
+  patientOnline = true;
+}
+
 
     _startParticipantWatcher();
 

@@ -20,6 +20,9 @@ from sqlalchemy import (
     Column, Integer, String, DateTime, Date, Enum as SAEnum, ForeignKey, Text, Boolean, Float,
     create_engine, or_, and_, text
 )
+from fastapi import Depends, HTTPException
+from sqlalchemy.orm import Session
+from firebase_admin import messaging
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 from io import BytesIO
 
@@ -1914,6 +1917,55 @@ async def pay_for_appointment(
     db.commit()
     return {"ok": True}
 
+# near other endpoints in app.py
+import traceback
+from fastapi import Body
+
+@app.post("/me/device_token")
+def me_device_token(payload: dict = Body(...),
+                    db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    """
+    Register or refresh a device token for the logged-in user.
+    Caller must be authenticated (current_user).
+    """
+    token = (payload.get("token") or "").strip()
+    platform = payload.get("platform") or ("web" if kIsWeb else "android")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+
+    try:
+        # upsert token for this user
+        existing = db.query(DeviceToken).filter(
+            DeviceToken.user_id == current_user.id,
+            DeviceToken.token == token
+        ).first()
+
+        now = datetime.utcnow()
+        if existing:
+            existing.last_seen_at = now
+            existing.platform = platform
+        else:
+            dt = DeviceToken(
+                user_id=current_user.id,
+                token=token,
+                platform=platform,
+                created_at=now,
+                last_seen_at=now
+            )
+            db.add(dt)
+
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        db.rollback()
+        # print stacktrace to server logs (very helpful when debugging 500)
+        print("me/device_token error:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="failed to save device token")
+
+
 @app.get("/appointments/{appointment_id}/payment", response_model=dict)
 def get_payment_for_appointment(
     appointment_id: int,
@@ -2309,6 +2361,59 @@ def start_call(appointment_id: int, current: User = Depends(require_role(UserRol
                 print("FCM send error:", err)
 
     return {"ok": True, "call_log_id": cl.id}
+
+
+@app.post("/appointments/{appointment_id}/call/start")
+def appointment_call_start(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # Validate appointment + doctor ownership (adjust to your models)
+    appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # Optional: ensure current_user is the doctor for this appointment
+    if current_user.role != 'doctor' and appt.doctor.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    # Collect patient user id & device tokens
+    patient_user_id = appt.patient.user_id
+    tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == patient_user_id, DeviceToken.platform == 'web').all()
+    tokens = [t.token for t in tokens_q if t and t.token]
+
+    if not tokens:
+        return {"ok": True, "sent": 0, "reason": "patient has no web tokens"}
+
+    data_payload = {
+        "type": "doctor_call",
+        "appointment_id": str(appointment_id),
+        "room": appt.video_room or "",
+        "doctor_name": appt.doctor.user.name if appt.doctor and appt.doctor.user else "",
+    }
+
+    message = messaging.MulticastMessage(
+        data=data_payload,
+        tokens=tokens,
+        webpush=messaging.WebpushConfig(
+            headers={"TTL": "60"},
+            notification=messaging.WebpushNotification(
+                title="Incoming call",
+                body=f"{data_payload['doctor_name']} is calling you",
+            ),
+            fcm_options=messaging.WebpushFCMOptions(link=f"{APP_BASE_URL}/") # set to your app URL
+        ),
+    )
+
+    try:
+        res = messaging.send_multicast(message)
+        # Optionally remove invalid tokens:
+        for idx, resp in enumerate(res.responses):
+            if not resp.success:
+                # if resp.exception indicates invalid token, delete it from DB
+                print("Failed token:", tokens[idx], resp.exception)
+        return {"ok": True, "sent": res.success_count, "failed": res.failure_count}
+    except Exception as e:
+        print("FCM send error:", e)
+        raise HTTPException(status_code=500, detail="Failed to send FCM")
+
 
 @app.post("/appointments/{appointment_id}/call/answer", response_model=dict)
 def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)):

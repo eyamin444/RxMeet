@@ -1,6 +1,6 @@
 // lib/screens/notifications/incoming_call.dart
 import 'package:flutter/material.dart';
-import '../../services/api.dart';
+import '../../Services/Api.dart';
 import '../../widgets/snack.dart';
 import '../../services/ringtone.dart';
 import 'package:livekit_client/livekit_client.dart' as lk;
@@ -29,6 +29,7 @@ class _IncomingCallPageState extends State<IncomingCallPage> {
   @override
   void initState() {
     super.initState();
+    // Play looping ringtone while IncomingCallPage is shown
     RingtoneService.playLooping();
   }
 
@@ -49,7 +50,8 @@ class _IncomingCallPageState extends State<IncomingCallPage> {
         throw Exception('Missing token/url from server');
       }
 
-      // Placeholder: navigate to your VideoScreen (replace with actual video UI)
+      // TODO: Replace this placeholder navigation with the real VideoScreen navigation.
+      // Example: Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => VideoScreen(...)));
       showSnack(context, 'Ready to join room ${widget.room}');
 
       setState(() => _joining = false);

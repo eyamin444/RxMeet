@@ -17,10 +17,10 @@ class RingtoneService {
       await _player.setVolume(0.0);
       if (kIsWeb) {
         // Use URLSource on web (resolve to /assets/...)
-        final url = Uri.base.resolve('assets/ringtone/telehealth_incoming_ringtone.ogg').toString();
+        final url = Uri.base.resolve('assets/ringtone/telehealth_incoming_ringtone.mp3').toString();
         await _player.play(UrlSource(url));
       } else {
-        await _player.play(AssetSource('assets/ringtone/telehealth_incoming_ringtone.ogg'));
+        await _player.play(AssetSource('assets/ringtone/telehealth_incoming_ringtone.mp3'));
       }
       await Future.delayed(const Duration(milliseconds: 250));
       await _player.stop();
@@ -34,10 +34,10 @@ class RingtoneService {
     try {
       await _player.setReleaseMode(ReleaseMode.loop);
       if (kIsWeb) {
-        final url = Uri.base.resolve('assets/ringtone/telehealth_incoming_ringtone.ogg').toString();
+        final url = Uri.base.resolve('assets/ringtone/telehealth_incoming_ringtone.mp3').toString();
         await _player.play(UrlSource(url));
       } else {
-        await _player.play(AssetSource('assets/ringtone/telehealth_incoming_ringtone.ogg'));
+        await _player.play(AssetSource('assets/ringtone/telehealth_incoming_ringtone.mp3'));
       }
     } catch (e) {
       print('RingtoneService.playLooping error: $e');

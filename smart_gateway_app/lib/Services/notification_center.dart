@@ -1,9 +1,14 @@
 // lib/services/notification_center.dart
 import 'dart:async';
 import 'dart:convert';
+
+import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../main.dart' show notifications;
+
+import '../main.dart' show notifications, navigatorKey;
+import 'ringtone.dart' show RingtoneService;
+import '../screens/notifications/incoming_call.dart' show IncomingCallPage;
 
 class LocalNotice {
   final int id; // unique
@@ -11,7 +16,7 @@ class LocalNotice {
   final String body;
   final DateTime at;
   final bool read;
-  final String type; // 'approved'|'rejected'|'completed'|'reminder'
+  final String type; // 'approved'|'rejected'|'completed'|'reminder'|'video_ready' etc
   final int? appointmentId;
 
   LocalNotice({
@@ -99,7 +104,6 @@ class NotificationCenter {
   Future<List<LocalNotice>> list() async => await _load();
 
   // --- Mutations (serialized) ---
-
   Future<void> markAllRead() {
     _lock = _lock.then((_) async {
       final list = await _load();
@@ -141,6 +145,7 @@ class NotificationCenter {
     return _lock;
   }
 
+  /// Push a notification into the local store and optionally show a system toast.
   Future<void> push({
     required String title,
     required String body,
@@ -181,6 +186,32 @@ class NotificationCenter {
           body,
           const NotificationDetails(android: android),
         );
+      }
+
+      // If doctor is ready, open incoming-call UI inside the app (foreground case).
+      if (type == 'video_ready') {
+        try {
+          final nav = navigatorKey.currentState;
+          if (nav != null) {
+            // Avoid pushing duplicate incoming pages if already visible:
+            // Basic guard: check last route's runtimeType or push only if mounted.
+            // Simple approach: push the page — your IncomingCallPage has internal checks.
+            nav.push(MaterialPageRoute(
+              builder: (_) => IncomingCallPage(
+                appointmentId: appointmentId ?? 0,
+                room: '',
+                doctorName: title,
+                callLogId: null,
+              ),
+            ));
+            // IncomingCallPage plays ringtone in its initState.
+            // If you prefer NotificationCenter to control ringtone instead,
+            // call RingtoneService.playLooping() here (but ensure you stop it when call accepted/declined).
+          }
+        } catch (e) {
+          // Keep the app robust even if navigation fails
+          print('NotificationCenter: failed to show incoming call UI: $e');
+        }
       }
     });
     return _lock;
