@@ -9,6 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart' show notifications, navigatorKey;
 import 'ringtone.dart' show RingtoneService;
 import '../screens/notifications/incoming_call.dart' show IncomingCallPage;
+import '../services/auth.dart' show AuthService; // use AuthService to get current user
+import '../models.dart' show User; // for typing the returned user, if needed
 
 class LocalNotice {
   final int id; // unique
@@ -18,6 +20,8 @@ class LocalNotice {
   final bool read;
   final String type; // 'approved'|'rejected'|'completed'|'reminder'|'video_ready' etc
   final int? appointmentId;
+  final String? room;
+  final int? callLogId;
 
   LocalNotice({
     required this.id,
@@ -27,6 +31,8 @@ class LocalNotice {
     this.read = false,
     required this.type,
     this.appointmentId,
+    this.room,
+    this.callLogId,
   });
 
   LocalNotice copyWith({bool? read}) => LocalNotice(
@@ -37,6 +43,8 @@ class LocalNotice {
         read: read ?? this.read,
         type: type,
         appointmentId: appointmentId,
+        room: room,
+        callLogId: callLogId,
       );
 
   Map<String, dynamic> toMap() => {
@@ -47,6 +55,8 @@ class LocalNotice {
         'read': read,
         'type': type,
         'appointmentId': appointmentId,
+        'room': room,
+        'callLogId': callLogId,
       };
 
   static LocalNotice fromMap(Map<String, dynamic> m) => LocalNotice(
@@ -57,6 +67,8 @@ class LocalNotice {
         read: m['read'] as bool? ?? false,
         type: m['type'] as String? ?? 'info',
         appointmentId: m['appointmentId'] as int?,
+        room: m['room'] as String?,
+        callLogId: m['callLogId'] as int?,
       );
 }
 
@@ -98,8 +110,7 @@ class NotificationCenter {
     _unread$.add(dedup.where((e) => !e.read).length);
   }
 
-  Future<int> unreadCount() async =>
-      (await _load()).where((e) => !e.read).length;
+  Future<int> unreadCount() async => (await _load()).where((e) => !e.read).length;
 
   Future<List<LocalNotice>> list() async => await _load();
 
@@ -151,6 +162,8 @@ class NotificationCenter {
     required String body,
     required String type,
     int? appointmentId,
+    String? room,
+    int? callLogId,
     bool alsoShowSystemToast = true,
   }) {
     _lock = _lock.then((_) async {
@@ -168,6 +181,8 @@ class NotificationCenter {
           read: false,
           type: type,
           appointmentId: appointmentId,
+          room: room,
+          callLogId: callLogId,
         ),
         ...list,
       ];
@@ -180,37 +195,70 @@ class NotificationCenter {
           importance: Importance.high,
           priority: Priority.high,
         );
-        await notifications.show(
-          id,
-          title,
-          body,
-          const NotificationDetails(android: android),
-        );
+        try {
+          await notifications.show(
+            id,
+            title,
+            body,
+            const NotificationDetails(android: android),
+          );
+        } catch (e) {
+          // ignore local notification errors
+          print('NotificationCenter: notifications.show error: $e');
+        }
       }
 
-      // If doctor is ready, open incoming-call UI inside the app (foreground case).
-      if (type == 'video_ready') {
+      // handle special call/type that should open IncomingCallPage for patients only
+      if (type == 'video_ready' || type == 'doctor_call') {
         try {
           final nav = navigatorKey.currentState;
-          if (nav != null) {
-            // Avoid pushing duplicate incoming pages if already visible:
-            // Basic guard: check last route's runtimeType or push only if mounted.
-            // Simple approach: push the page — your IncomingCallPage has internal checks.
+          if (nav == null) return;
+
+          // Obtain current user info asynchronously using AuthService.whoAmI().
+          // If it fails, default to showing the incoming UI (safe behavior).
+          bool isDoctor = false;
+          try {
+            final User? user = await AuthService.whoAmI();
+            if (user != null && user.role != null && user.role == 'doctor') {
+              isDoctor = true;
+            }
+          } catch (_) {
+            isDoctor = false;
+          }
+
+          if (!isDoctor) {
+            // Open incoming call UI for patients only.
             nav.push(MaterialPageRoute(
               builder: (_) => IncomingCallPage(
                 appointmentId: appointmentId ?? 0,
-                room: '',
+                room: room ?? '',
                 doctorName: title,
-                callLogId: null,
+                callLogId: callLogId,
               ),
             ));
-            // IncomingCallPage plays ringtone in its initState.
-            // If you prefer NotificationCenter to control ringtone instead,
-            // call RingtoneService.playLooping() here (but ensure you stop it when call accepted/declined).
+            // IncomingCallPage will start ringtone in its initState.
+          } else {
+            // Doctor: do not open incoming UI; log and keep local notice instead.
+            print('NotificationCenter: doctor received call-notice; not opening IncomingCallPage.');
+            // Optional: show a tiny local toast for doctor only (no ringtone)
+            try {
+              await notifications.show(
+                id + 1,
+                'Call initiated',
+                'Patient(s) will be notified',
+                const NotificationDetails(
+                  android: AndroidNotificationDetails(
+                    'events',
+                    'In-app events',
+                    importance: Importance.low,
+                    priority: Priority.low,
+                  ),
+                ),
+              );
+            } catch (_) {}
           }
         } catch (e) {
-          // Keep the app robust even if navigation fails
-          print('NotificationCenter: failed to show incoming call UI: $e');
+          print('NotificationCenter: failed to handle call UI: $e');
         }
       }
     });

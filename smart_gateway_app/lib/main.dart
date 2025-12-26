@@ -8,6 +8,8 @@ import 'services/api.dart';
 import 'services/auth.dart';
 import 'models.dart';
 import 'widgets/snack.dart';
+import 'services/notification_center.dart';
+
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -176,110 +178,129 @@ class _BootstrapState extends State<_Bootstrap> {
     _bootstrap();
   }
 
-  Future<void> _bootstrap() async {
-    try {
-      me = await AuthService.whoAmI();
-    } catch (_) {
-      me = null;
+Future<void> _bootstrap() async {
+  try {
+    me = await AuthService.whoAmI();
+  } catch (_) {
+    me = null;
+  }
+
+  // If logged-in patient, show ringtone unlock prompt once (web)
+  if (me != null && me!.role == 'patient') {
+    final prefs = await SharedPreferences.getInstance();
+    final unlocked = prefs.getBool('ringtone_unlocked') ?? false;
+    if (!unlocked) {
+      // call after frame so app is ready
+      WidgetsBinding.instance.addPostFrameCallback((_) => _showEnableRingtoneDialog());
     }
+  }
 
-    // If logged-in patient, show ringtone unlock prompt once (web)
-    if (me != null && me!.role == 'patient') {
-      // Prompt the user in web to allow audio (we do not auto-play).
-      final prefs = await SharedPreferences.getInstance();
-      final unlocked = prefs.getBool('ringtone_unlocked') ?? false;
-      if (!unlocked) {
-        // call after frame so app is ready
-        WidgetsBinding.instance.addPostFrameCallback((_) => _showEnableRingtoneDialog());
-      }
-    }
-
-    // <<FCM_TOKEN_REGISTER>>
-    // Register FCM token and message handlers ONLY for patients.
-    if (me != null && me!.role == 'patient') {
-      // Android 13+ runtime notification permission
-      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
-        try {
-          var status = await Permission.notification.status;
-          if (status.isDenied || status.isLimited || status.isPermanentlyDenied) {
-            await Permission.notification.request();
-          }
-        } catch (e) {
-          print('Permission.request error: $e');
-        }
-      } else if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
-        // iOS request
-        await FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
-      } else if (kIsWeb) {
-        // For web, nothing automatic; token can still require vapidKey depending on configuration.
-      }
-
-      // Get token (try plain, and fallback with vapidKey if web requires it)
+  // <<FCM_TOKEN_REGISTER>>
+  // Register FCM token and message handlers ONLY for patients.
+  if (me != null && me!.role == 'patient') {
+    // Android 13+ runtime notification permission
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
       try {
-        String? token;
-        try {
-          token = await FirebaseMessaging.instance.getToken();
-        } catch (e) {
-          // fallback: some web setups require vapidKey
-          try {
-            final webOpts = DefaultFirebaseOptions.web;
-            final dynamic maybeVapid = webOpts != null ? (webOpts as dynamic).vapidKey : null;
-            if (kIsWeb && maybeVapid != null) {
-              token = await FirebaseMessaging.instance.getToken(vapidKey: maybeVapid as String);
-            }
-          } catch (_) {
-            // ignore
-          }
-        }
-
-        if (token != null && token.isNotEmpty) {
-          await Api.post('/me/device_token', data: {'token': token, 'platform': kIsWeb ? 'web' : 'android'});
-          print('FCM token sent to server: $token');
-        } else {
-          print('FCM getToken returned null/empty');
+        var status = await Permission.notification.status;
+        if (status.isDenied || status.isLimited || status.isPermanentlyDenied) {
+          await Permission.notification.request();
         }
       } catch (e) {
-        print('Failed to obtain/send FCM token: $e');
+        print('Permission.request error: $e');
+      }
+    } else if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+      // iOS request
+      await FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
+    } else if (kIsWeb) {
+      // For web, nothing automatic; token can still require vapidKey depending on configuration.
+    }
+
+    // Get token (try plain, and fallback with vapidKey if web requires it)
+    try {
+      String? token;
+      try {
+        token = await FirebaseMessaging.instance.getToken();
+      } catch (e) {
+        // fallback: some web setups require vapidKey
+        try {
+          final webOpts = DefaultFirebaseOptions.web;
+          final dynamic maybeVapid = webOpts != null ? (webOpts as dynamic).vapidKey : null;
+          if (kIsWeb && maybeVapid != null) {
+            token = await FirebaseMessaging.instance.getToken(vapidKey: maybeVapid as String);
+          }
+        } catch (_) {
+          // ignore
+        }
       }
 
-      // Listen for token refresh
-      FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
-        try {
-          await Api.post('/me/device_token', data: {'token': newToken});
-          print('FCM refreshed token sent: $newToken');
-        } catch (e) {
-          print('Failed to send refreshed FCM token: $e');
-        }
-      });
+      if (token != null && token.isNotEmpty) {
+        await Api.post('/me/device_token', data: {'token': token, 'platform': kIsWeb ? 'web' : 'android'});
+        print('FCM token sent to server: $token');
+      } else {
+        print('FCM getToken returned null/empty');
+      }
+    } catch (e) {
+      print('Failed to obtain/send FCM token: $e');
+    }
 
-      // <<FCM_MESSAGE_HANDLERS>>
-      // Foreground messages: open IncomingCallPage on doctor_call (which plays ringtone).
-      FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+    // Listen for token refresh
+    FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
+      try {
+        await Api.post('/me/device_token', data: {'token': newToken});
+        print('FCM refreshed token sent: $newToken');
+      } catch (e) {
+        print('Failed to send refreshed FCM token: $e');
+      }
+    });
+
+    // <<FCM_MESSAGE_HANDLERS>>
+    // Foreground messages
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+      try {
         final data = message.data;
-        final isCall = (data['type'] == 'doctor_call');
         print('FCM onMessage: ${data} notification=${message.notification}');
-        if (isCall) {
-          final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
-          final room = data['room'] ?? '';
-          final doctorName = data['doctor_name'] ?? 'Doctor';
-          final callLogId = data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null;
 
-          // Push incoming call page (IncomingCallPage will play ringtone in initState)
-          navigatorKey.currentState?.push(MaterialPageRoute(
-            builder: (_) => IncomingCallPage(
-              appointmentId: apptId,
-              room: room,
-              doctorName: doctorName,
-              callLogId: callLogId,
-            ),
-          ));
+        // If this is a doctor_call / video_ready, open IncomingCallPage only for patients
+        // Use the 'me' we loaded above in _bootstrap().
+        final isDoctor = me?.role == 'doctor';
+
+        if (data['type'] == 'doctor_call' || data['type'] == 'video_ready') {
+          if (!isDoctor) {
+            // Show incoming call page for patient; IncomingCallPage will play ringtone in initState
+            navigatorKey.currentState?.push(
+              MaterialPageRoute(
+                builder: (_) => IncomingCallPage(
+                  appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
+                  room: data['room'] ?? '',
+                  doctorName: data['doctor_name'] ?? '',
+                  callLogId: data.containsKey('call_log_id')
+                      ? int.tryParse(data['call_log_id'] ?? '')
+                      : null,
+                ),
+              ),
+            );
+          } else {
+            // For doctors, show a small local non-intrusive toast
+            await NotificationCenter().push(
+              title: 'Doctor is ready (local)',
+              body: 'Call initiated — patient will be notified',
+              type: 'info',
+              appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
+              alsoShowSystemToast: true,
+            );
+          }
         } else {
-          _showLocalNotification(message, isCall: false);
+          // Non-call notification: show local notification
+          await _showLocalNotification(message, isCall: false);
         }
-      });
+      } catch (e, st) {
+        print('Error handling onMessage: $e\n$st');
+      }
+    });
 
-      // When user taps notification and app opens
-      FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+    // When user taps notification and app opens from background
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) async {
+      try {
         final data = message.data;
         print('FCM onMessageOpenedApp: ${data}');
         if (data['type'] == 'doctor_call') {
@@ -297,12 +318,15 @@ class _BootstrapState extends State<_Bootstrap> {
             ),
           ));
         } else {
-          // Open normal notification target (optional)
-          _showLocalNotification(message, isCall: false);
+          await _showLocalNotification(message, isCall: false);
         }
-      });
+      } catch (e) {
+        print('Error in onMessageOpenedApp handler: $e');
+      }
+    });
 
-      // App launched from terminated state via a notification
+    // App launched from terminated state via a notification
+    try {
       final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
       if (initialMessage != null && initialMessage.data['type'] == 'doctor_call') {
         final data = initialMessage.data;
@@ -322,10 +346,13 @@ class _BootstrapState extends State<_Bootstrap> {
           ));
         });
       }
-    } // end if patient
+    } catch (e) {
+      print('Error handling initialMessage: $e');
+    }
+  } // end if patient
 
-    if (mounted) setState(() => loading = false);
-  }
+  if (mounted) setState(() => loading = false);
+}
 
   /// <<RINGTONE_UNLOCK_PROMPT>>
   /// This dialog is shown to web patients once to allow autoplay (tiny unlock play).

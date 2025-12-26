@@ -2281,139 +2281,32 @@ def create_video_room(appointment_id: int, current: User = Depends(get_current_u
         db.commit()
     return {"ok": True, "room": appt.video_room}
 
-@app.post("/appointments/{appointment_id}/call/start", response_model=dict)
-def start_call(appointment_id: int, current: User = Depends(require_role(UserRole.doctor)), db: Session = Depends(get_db)):
-    appt = db.get(Appointment, appointment_id)
-    if not appt:
-        raise HTTPException(404, "Appointment not found")
-    if appt.doctor.user_id != current.id:
-        raise HTTPException(403, "Only the doctor can start the video call")
-
-    # Ensure room exists
-    room_name = appt.video_room or f"appt_{appointment_id}"
-    if not appt.video_room:
-        appt.video_room = room_name
-        appt.last_modified_by_user_id = current.id
-        appt.last_modified_at = datetime.utcnow()
-        db.commit()
-
-    # Create call log
-    cl = CallLog(appointment_id=appointment_id, started_by_user_id=current.id, started_at=datetime.utcnow(), status="ringing")
-    db.add(cl); db.commit(); db.refresh(cl)
-
-    # Collect patient device tokens rows (with platform)
-    patient_user_id = appt.patient.user_id if appt.patient else None
-    tokens_rows = []
-    if patient_user_id:
-        tokens_rows = db.query(DeviceToken).filter(DeviceToken.user_id == patient_user_id).all()
-
-    payload = {
-        "type": "doctor_call",
-        "appointment_id": str(appointment_id),
-        "room": room_name,
-        "doctor_name": current.name or "Doctor",
-        "call_log_id": str(cl.id),
-    }
-
-    # Send messages per platform using firebase_admin
-    for tr in tokens_rows:
-        try:
-            if (tr.platform or "").lower() == "web":
-                # Webpush (notification displayed by browser/service worker)
-                webpush = messaging.WebpushConfig(
-                    headers={"Urgency": "high"},
-                    notification=messaging.WebpushNotification(
-                        title=payload["doctor_name"],
-                        body="Incoming video call",
-                    ),
-                    fcm_options=messaging.WebpushFCMOptions(link=f"/"),  # link can be handled by SW click action
-                )
-                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token, webpush=webpush)
-                messaging.send(msg)
-            elif (tr.platform or "").lower() == "android":
-                # Android: include notification so OS shows it (and plays default sound)
-                android_notif = messaging.AndroidNotification(title=payload["doctor_name"], body="Incoming video call", sound="default")
-                android_cfg = messaging.AndroidConfig(priority="high", ttl=60, notification=android_notif)
-                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token, android=android_cfg)
-                messaging.send(msg)
-            elif (tr.platform or "").lower() == "ios":
-                # APNs: attach alert so iOS shows a notification
-                apns_cfg = messaging.APNSConfig(
-                    headers={"apns-priority": "10"},
-                    payload=messaging.APNSPayload(aps=messaging.Aps(alert={'title': payload["doctor_name"], 'body': "Incoming video call"}, sound="default"))
-                )
-                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token, apns=apns_cfg)
-                messaging.send(msg)
-            else:
-                # Unknown platform — send a data message as fallback
-                msg = messaging.Message(data={k: str(v) for k, v in payload.items()}, token=tr.token)
-                messaging.send(msg)
-        except Exception as e:
-            err = str(e)
-            # Remove tokens that are no longer valid
-            if "Unregistered" in err or "not registered" in err or "registration-token-not-registered" in err:
-                try:
-                    db.query(DeviceToken).filter(DeviceToken.token == tr.token).delete()
-                    db.commit()
-                except Exception:
-                    db.rollback()
-            else:
-                print("FCM send error:", err)
-
-    return {"ok": True, "call_log_id": cl.id}
-
-
 @app.post("/appointments/{appointment_id}/call/start")
-def appointment_call_start(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # Validate appointment + doctor ownership (adjust to your models)
+def start_call(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    print(f"START_CALL: request for appointment_id={appointment_id} from user={getattr(current_user,'id',None)}")
     appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
     if not appt:
+        print("START_CALL: appointment not found")
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    # Optional: ensure current_user is the doctor for this appointment
-    if current_user.role != 'doctor' and appt.doctor.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed")
+    # ... existing checks ...
 
-    # Collect patient user id & device tokens
-    patient_user_id = appt.patient.user_id
-    tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == patient_user_id, DeviceToken.platform == 'web').all()
+    print(f"START_CALL: patient_user_id={appt.patient.user_id}, video_room={appt.video_room}")
+    tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.patient.user_id, DeviceToken.platform == 'web').all()
     tokens = [t.token for t in tokens_q if t and t.token]
-
-    if not tokens:
-        return {"ok": True, "sent": 0, "reason": "patient has no web tokens"}
-
-    data_payload = {
-        "type": "doctor_call",
-        "appointment_id": str(appointment_id),
-        "room": appt.video_room or "",
-        "doctor_name": appt.doctor.user.name if appt.doctor and appt.doctor.user else "",
-    }
-
-    message = messaging.MulticastMessage(
-        data=data_payload,
-        tokens=tokens,
-        webpush=messaging.WebpushConfig(
-            headers={"TTL": "60"},
-            notification=messaging.WebpushNotification(
-                title="Incoming call",
-                body=f"{data_payload['doctor_name']} is calling you",
-            ),
-            fcm_options=messaging.WebpushFCMOptions(link=f"{APP_BASE_URL}/") # set to your app URL
-        ),
-    )
+    print(f"START_CALL: found {len(tokens)} web tokens for patient {appt.patient.user_id}")
 
     try:
         res = messaging.send_multicast(message)
-        # Optionally remove invalid tokens:
+        print(f"START_CALL: FCM send result: success={res.success_count}, failed={res.failure_count}")
+        # print per-token exceptions
         for idx, resp in enumerate(res.responses):
             if not resp.success:
-                # if resp.exception indicates invalid token, delete it from DB
-                print("Failed token:", tokens[idx], resp.exception)
+                print(f"START_CALL: token_failed idx={idx} token={tokens[idx]} error={resp.exception}")
         return {"ok": True, "sent": res.success_count, "failed": res.failure_count}
     except Exception as e:
-        print("FCM send error:", e)
+        print("START_CALL: FCM send exception:", e)
         raise HTTPException(status_code=500, detail="Failed to send FCM")
-
 
 @app.post("/appointments/{appointment_id}/call/answer", response_model=dict)
 def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)):

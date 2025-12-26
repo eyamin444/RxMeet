@@ -94,29 +94,33 @@ class _VideoScreenState extends State<VideoScreen> {
 
     _room = room;
 
-   if (widget.isDoctor) {
-  doctorOnline = true;
+    // --- DOCTOR vs PATIENT behavior
+    if (widget.isDoctor) {
+      doctorOnline = true;
 
-  // Tell the backend that the doctor has joined and ask the server to notify
-  // the patient(s). The server should send a data-only FCM with type='doctor_call'
-  // so the patient app will open the IncomingCallPage.
-  try {
-    await Api.post('/appointments/${widget.appointmentId}/call/start', data: {});
-  } catch (e) {
-    // If backend notification fails, fallback to a local notice for the doctor only.
-    // (This keeps doctor informed but won't disturb patient flow.)
-    print('Failed to notify backend to start call: $e');
-    await NotificationCenter().push(
-      title: 'Doctor is ready (local)',
-      body: 'Doctor is ready, but notifying patient failed.',
-      type: 'video_ready',
-      appointmentId: widget.appointmentId,
-    );
-  }
-} else {
-  patientOnline = true;
-}
-
+      // DO NOT show incoming call UI locally on doctor device.
+      // Notify backend so it will notify the remote patient(s).
+      // We log the request and response for debugging.
+      try {
+        print('VIDEO_SCREEN: doctor connecting -> will notify backend for appt ${widget.appointmentId}');
+        final resp = await Api.post('/appointments/${widget.appointmentId}/call/start', data: {});
+        print('VIDEO_SCREEN: backend call/start response: $resp');
+      } catch (e, st) {
+        // In case of backend failure, show a small local notice for doctor only.
+        // This should NOT show a full incoming-call UI on the doctor device.
+        print('VIDEO_SCREEN: Failed to notify backend to start call: $e');
+        print(st);
+        await NotificationCenter().push(
+          title: 'Doctor is ready (local)',
+          body: 'Doctor is ready, but notifying patient failed.',
+          type: 'video_ready',
+          appointmentId: widget.appointmentId,
+        );
+      }
+    } else {
+      // Patient path
+      patientOnline = true;
+    }
 
     _startParticipantWatcher();
 

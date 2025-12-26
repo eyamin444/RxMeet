@@ -1,0 +1,6 @@
+smart_gateway_app\lib\screens\video\video_screen.dart:113:        await NotificationCenter().push(
+smart_gateway_app\lib\screens\video\video_screen.dart:350:                            await NotificationCenter().push(
+smart_gateway_app\lib\Services\notification_sync.dart:26:          await NotificationCenter().push(
+smart_gateway_app\lib\Services\notification_sync.dart:38:          await NotificationCenter().push(
+smart_gateway_app\lib\Services\notification_sync.dart:46:          await NotificationCenter().push(
+smart_gateway_app\lib\Services\notification_sync.dart:62:          await NotificationCenter().push(

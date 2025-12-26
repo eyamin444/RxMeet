@@ -1,0 +1,14 @@
+smart_gateway_app\lib\main.dart:256:      // Foreground messages: open IncomingCallPage on doctor_call (which plays ringtone).
+smart_gateway_app\lib\main.dart:267:          // Push incoming call page (IncomingCallPage will play ringtone in initState)
+smart_gateway_app\lib\main.dart:269:            builder: (_) => IncomingCallPage(
+smart_gateway_app\lib\main.dart:292:            builder: (_) => IncomingCallPage(
+smart_gateway_app\lib\main.dart:316:            builder: (_) => IncomingCallPage(
+smart_gateway_app\lib\screens\notifications\incoming_call.dart:8:class IncomingCallPage extends StatefulWidget {
+smart_gateway_app\lib\screens\notifications\incoming_call.dart:14:  const IncomingCallPage({
+smart_gateway_app\lib\screens\notifications\incoming_call.dart:23:  State<IncomingCallPage> createState() => _IncomingCallPageState();
+smart_gateway_app\lib\screens\notifications\incoming_call.dart:26:class _IncomingCallPageState extends State<IncomingCallPage> {
+smart_gateway_app\lib\screens\notifications\incoming_call.dart:32:    // Play looping ringtone while IncomingCallPage is shown
+smart_gateway_app\lib\Services\notification_center.dart:11:import '../screens/notifications/incoming_call.dart' show IncomingCallPage;
+smart_gateway_app\lib\Services\notification_center.dart:198:            // Simple approach: push the page — your IncomingCallPage has internal checks.
+smart_gateway_app\lib\Services\notification_center.dart:200:              builder: (_) => IncomingCallPage(
+smart_gateway_app\lib\Services\notification_center.dart:207:            // IncomingCallPage plays ringtone in its initState.
