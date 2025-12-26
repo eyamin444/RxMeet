@@ -42,18 +42,54 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "devsecret_1234567890_12345
 
 from sqlalchemy.pool import NullPool, StaticPool
 
-# Firebase Admin for sending FCM from the server
+import json
+import os
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-FIREBASE_CREDENTIAL_PATH = os.getenv("FIREBASE_CREDENTIAL_PATH")  # set this env var
-if FIREBASE_CREDENTIAL_PATH and not firebase_admin._apps:
+FIREBASE_CREDENTIAL_PATH = os.getenv("FIREBASE_CREDENTIAL_PATH", "D:\\SmartGateway\\firebase-service-account.json")
+
+def ensure_firebase_initialized():
+    """
+    Idempotent initialize firebase_admin and ensure projectId is supplied
+    so Cloud Messaging has a project context in every process/worker.
+    """
     try:
-        cred = credentials.Certificate(FIREBASE_CREDENTIAL_PATH)
-        firebase_admin.initialize_app(cred)
-        print("Firebase admin initialized")
+        if firebase_admin._apps:
+            # already initialized in this process
+            try:
+                app = firebase_admin.get_app()
+                print("Firebase app exists, project_id:", getattr(app, 'project_id', None))
+            except Exception:
+                pass
+            return True
+
+        if FIREBASE_CREDENTIAL_PATH and os.path.exists(FIREBASE_CREDENTIAL_PATH):
+            # read service account JSON to extract project_id
+            with open(FIREBASE_CREDENTIAL_PATH, "r", encoding="utf-8") as fh:
+                sa = json.load(fh)
+            project_id = sa.get("project_id")
+            # Set GOOGLE_CLOUD_PROJECT env var for libraries that read it
+            if project_id:
+                os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
+
+            cred = credentials.Certificate(FIREBASE_CREDENTIAL_PATH)
+            init_opts = {}
+            if project_id:
+                init_opts["projectId"] = project_id
+
+            firebase_admin.initialize_app(cred, options=init_opts)
+            print("Firebase admin initialized (project_id={})".format(project_id))
+            return True
+        else:
+            # fallback to ADC (not recommended for production)
+            firebase_admin.initialize_app()
+            print("Firebase admin initialized (ADC fallback)")
+            return True
     except Exception as e:
         print("Failed to initialize firebase_admin:", e)
+        return False
+
 
 
 def _engine_from_env(url: str):
@@ -858,6 +894,13 @@ def on_startup():
     os.makedirs("uploads", exist_ok=True)
     create_db()
     ensure_sqlite_schema(engine)
+
+    # Ensure Firebase is initialized in this process
+    ok = ensure_firebase_initialized()
+    if not ok:
+        # if you want to fail fast in dev, raise here. Otherwise just log.
+        print("Warning: firebase_admin not initialized at startup")
+
 
 
 @app.get("/ping")
@@ -2283,30 +2326,146 @@ def create_video_room(appointment_id: int, current: User = Depends(get_current_u
 
 @app.post("/appointments/{appointment_id}/call/start")
 def start_call(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    print(f"START_CALL: request for appointment_id={appointment_id} from user={getattr(current_user,'id',None)}")
+    # Ensure firebase is initialized in this worker/process
+    if not ensure_firebase_initialized():
+        raise HTTPException(status_code=500, detail="Server firebase not initialized")
+
+    import traceback
+    print(f"START_CALL: appointment_id={appointment_id} by user={getattr(current_user,'id',None)}")
+
     appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
     if not appt:
-        print("START_CALL: appointment not found")
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    # ... existing checks ...
+    if current_user.role != UserRole.doctor or appt.doctor.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only doctor can start the call")
 
-    print(f"START_CALL: patient_user_id={appt.patient.user_id}, video_room={appt.video_room}")
-    tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.patient.user_id, DeviceToken.platform == 'web').all()
-    tokens = [t.token for t in tokens_q if t and t.token]
-    print(f"START_CALL: found {len(tokens)} web tokens for patient {appt.patient.user_id}")
+    if not getattr(appt, "patient", None) or not getattr(appt.patient, "user_id", None):
+        raise HTTPException(status_code=400, detail="Appointment patient information missing")
 
+    # List tokens
+    tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.patient.user_id).all()
+    tokens = list({t.token for t in tokens_q if t and t.token})
+    print(f"START_CALL: found {len(tokens)} tokens for patient_user_id={appt.patient.user_id}")
+    if not tokens:
+        return {"ok": True, "sent": 0, "failed": 0, "errors": []}
+
+    title = f"{(appt.doctor.user.name if appt.doctor and appt.doctor.user else 'Doctor')} is calling"
+    body = "Tap to answer the call"
+    data_payload = {
+        "type": "doctor_call",
+        "appointment_id": str(appt.id),
+        "doctor_name": (appt.doctor.user.name if appt.doctor and appt.doctor.user else "Doctor"),
+        "room": (appt.video_room or f"room_{appt.id}")
+    }
+
+    # Build optional platform configs if available (guarded)
+    android_cfg = None
     try:
-        res = messaging.send_multicast(message)
-        print(f"START_CALL: FCM send result: success={res.success_count}, failed={res.failure_count}")
-        # print per-token exceptions
-        for idx, resp in enumerate(res.responses):
-            if not resp.success:
-                print(f"START_CALL: token_failed idx={idx} token={tokens[idx]} error={resp.exception}")
-        return {"ok": True, "sent": res.success_count, "failed": res.failure_count}
+        if hasattr(messaging, "AndroidConfig") and hasattr(messaging, "AndroidNotification"):
+            android_cfg = messaging.AndroidConfig(
+                priority="high",
+                ttl=60,
+                notification=messaging.AndroidNotification(
+                    channel_id="calls_channel",
+                    sound="default",
+                    click_action="FLUTTER_NOTIFICATION_CLICK",
+                ),
+            )
     except Exception as e:
-        print("START_CALL: FCM send exception:", e)
-        raise HTTPException(status_code=500, detail="Failed to send FCM")
+        print("START_CALL: AndroidConfig skipped:", e)
+
+    apns_cfg = None
+    try:
+        if hasattr(messaging, "ApnsConfig") and hasattr(messaging, "ApnsPayload") and hasattr(messaging, "Aps"):
+            apns_cfg = messaging.ApnsConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.ApnsPayload(
+                    aps=messaging.Aps(alert={"title": title, "body": body}, sound="telehealth_incoming_ringtone.caf")
+                ),
+            )
+    except Exception as e:
+        print("START_CALL: ApnsConfig skipped:", e)
+
+    webpush_cfg = None
+    try:
+        if hasattr(messaging, "WebpushConfig") and hasattr(messaging, "WebpushNotification"):
+            webpush_cfg = messaging.WebpushConfig(
+                headers={"TTL": "60", "Urgency": "high"},
+                notification=messaging.WebpushNotification(title=title, body=body),
+            )
+    except Exception as e:
+        print("START_CALL: WebpushConfig skipped:", e)
+
+    notification_obj = None
+    if hasattr(messaging, "Notification"):
+        try:
+            notification_obj = messaging.Notification(title=title, body=body)
+        except Exception:
+            notification_obj = None
+
+    success = 0
+    failed = 0
+    errors = []  # collect {token, error}
+
+    # Try send_multicast if available
+    if hasattr(messaging, "send_multicast") and hasattr(messaging, "MulticastMessage"):
+        try:
+            multicast = messaging.MulticastMessage(
+                notification=(notification_obj if notification_obj else None),
+                data={k: str(v) for k, v in data_payload.items()},
+                android=android_cfg,
+                apns=apns_cfg,
+                webpush=webpush_cfg,
+                tokens=tokens,
+            )
+            res = messaging.send_multicast(multicast)
+            success = int(res.success_count or 0)
+            failed = int(res.failure_count or 0)
+            print(f"START_CALL: send_multicast result: success={success}, failed={failed}")
+            for i, resp in enumerate(res.responses):
+                if not resp.success:
+                    err = str(resp.exception) if resp.exception else "unknown"
+                    errors.append({"token": multicast.tokens[i], "error": err})
+                    # prune invalid tokens
+                    if "Unregistered" in err or "not registered" in err or "registration-token-not-registered" in err:
+                        try:
+                            db.query(DeviceToken).filter(DeviceToken.token == multicast.tokens[i]).delete()
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+            return {"ok": True, "sent": success, "failed": failed, "errors": errors}
+        except Exception as e:
+            print("START_CALL: send_multicast failed, falling back:", e)
+            traceback.print_exc()
+
+    # Per-token fallback
+    for t in tokens:
+        try:
+            msg_kwargs = {"data": {k: str(v) for k, v in data_payload.items()}, "token": t}
+            if notification_obj: msg_kwargs["notification"] = notification_obj
+            if android_cfg: msg_kwargs["android"] = android_cfg
+            if apns_cfg: msg_kwargs["apns"] = apns_cfg
+            if webpush_cfg: msg_kwargs["webpush"] = webpush_cfg
+
+            msg = messaging.Message(**msg_kwargs)
+            messaging.send(msg)
+            success += 1
+        except Exception as e:
+            failed += 1
+            err = str(e)
+            print(f"START_CALL: send to token failed token={t} error={err}")
+            errors.append({"token": t, "error": err})
+            if "Unregistered" in err or "not registered" in err or "registration-token-not-registered" in err:
+                try:
+                    db.query(DeviceToken).filter(DeviceToken.token == t).delete()
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            continue
+
+    print(f"START_CALL: per-token send result: success={success}, failed={failed}")
+    return {"ok": True, "sent": success, "failed": failed, "errors": errors}
 
 @app.post("/appointments/{appointment_id}/call/answer", response_model=dict)
 def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)):

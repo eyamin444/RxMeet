@@ -76,28 +76,35 @@ Future<void> initNotifications() async {
   tz.setLocalLocation(tz.getLocation('Asia/Dhaka'));
 
   // Request permission for notifications on Android 13+ (and create channels)
-  final androidImpl =
-      notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-  await androidImpl?.requestNotificationsPermission();
 
-  if (androidImpl != null) {
-    try {
-      await androidImpl.createNotificationChannel(const AndroidNotificationChannel(
-        'default_channel',
-        'General',
-        description: 'General notifications',
-        importance: Importance.defaultImportance,
-      ));
-      await androidImpl.createNotificationChannel(const AndroidNotificationChannel(
-        'calls_channel',
-        'Incoming Calls',
-        description: 'Incoming call notifications',
-        importance: Importance.max,
-      ));
-    } catch (e) {
-      print('createNotificationChannel error: $e');
-    }
+final androidImpl =
+    notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+await androidImpl?.requestNotificationsPermission();
+
+if (androidImpl != null) {
+  try {
+    await androidImpl.createNotificationChannel(const AndroidNotificationChannel(
+      'default_channel',
+      'General',
+      description: 'General notifications',
+      importance: Importance.defaultImportance,
+    ));
+
+    // Calls channel with custom native sound
+    final callsChannel = AndroidNotificationChannel(
+      'calls_channel',
+      'Incoming Calls',
+      description: 'Incoming call notifications',
+      importance: Importance.max,
+      sound: RawResourceAndroidNotificationSound('telehealth_incoming_ringtone'),
+      playSound: true,
+    );
+    await androidImpl.createNotificationChannel(callsChannel);
+  } catch (e) {
+    print('createNotificationChannel error: $e');
   }
+}
+
 }
 
 /// Helper to show a local notification. For call notifications sets fullScreenIntent on Android.
