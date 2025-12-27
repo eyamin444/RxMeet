@@ -1,5 +1,7 @@
 // lib/main.dart
 import 'dart:async';
+import 'dart:convert';
+
 
 import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
@@ -51,19 +53,46 @@ final FlutterLocalNotificationsPlugin notifications = FlutterLocalNotificationsP
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 /// <<FCM_BACKGROUND_HANDLER>>
-// Background handler must be a top-level function.
+// Background handler must be a top-level function and reachable by the platform.
+// Use vm:entry-point to avoid tree-shaking in release builds.
+@pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  // Ensure Firebase is initialized in the background isolate.
+  // Initialize Flutter & Firebase in background isolate
+  WidgetsFlutterBinding.ensureInitialized();
   if (kIsWeb) {
     await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   } else {
     await Firebase.initializeApp();
   }
 
+  // Initialize notifications in background (safe, idempotent)
+  try {
+    await initNotifications();
+  } catch (e) {
+    print('Background initNotifications error: $e');
+  }
+
   // Lightweight log for debugging.
-  // Avoid heavy work here.
   print('FCM background: id=${message.messageId} data=${message.data}');
+
+  // If this is a call notification, show a full-screen local notification so the
+  // system can present the incoming-call UI (and play sound) even when app is backgrounded.
+  try {
+    final data = message.data;
+    final type = (data['type'] ?? '').toString();
+
+    if (type == 'doctor_call' || type == 'video_ready') {
+      // Show a full-screen incoming call notification (with native ringtone)
+      await _showLocalNotification(message, isCall: true);
+    } else {
+      // Non-call: show normal notification
+      await _showLocalNotification(message, isCall: false);
+    }
+  } catch (e) {
+    print('Background handler show notification error: $e');
+  }
 }
+
 
 /// <<INIT_NOTIFICATIONS>>
 Future<void> initNotifications() async {
@@ -100,6 +129,7 @@ if (androidImpl != null) {
       playSound: true,
     );
     await androidImpl.createNotificationChannel(callsChannel);
+
   } catch (e) {
     print('createNotificationChannel error: $e');
   }
@@ -107,7 +137,6 @@ if (androidImpl != null) {
 
 }
 
-/// Helper to show a local notification. For call notifications sets fullScreenIntent on Android.
 Future<void> _showLocalNotification(RemoteMessage message, {bool isCall = false}) async {
   final data = message.data;
   final title = message.notification?.title ?? data['title'] ?? (isCall ? 'Incoming call' : 'Notification');
@@ -122,12 +151,19 @@ Future<void> _showLocalNotification(RemoteMessage message, {bool isCall = false}
     playSound: true,
     fullScreenIntent: isCall,
     category: isCall ? AndroidNotificationCategory.call : AndroidNotificationCategory.message,
+    // Use the native ringtone resource for calls (calls_channel must be created with the resource)
+    sound: isCall ? const RawResourceAndroidNotificationSound('telehealth_incoming_ringtone') : null,
+    visibility: NotificationVisibility.public,
   );
 
   final details = NotificationDetails(android: androidDetails);
   final id = DateTime.now().microsecond;
-  await notifications.show(id, title, body, details, payload: data.isNotEmpty ? data.toString() : null);
+
+  // Use JSON payload so the UI can parse it reliably on tap/open
+  final payload = jsonEncode(data);
+  await notifications.show(id, title, body, details, payload: payload);
 }
+
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

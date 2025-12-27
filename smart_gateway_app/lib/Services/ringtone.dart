@@ -16,7 +16,6 @@ class RingtoneService {
       await _player.setReleaseMode(ReleaseMode.stop);
       await _player.setVolume(0.0);
       if (kIsWeb) {
-        // Use URLSource on web (resolve to /assets/...)
         final url = Uri.base.resolve('assets/ringtone/telehealth_incoming_ringtone.mp3').toString();
         await _player.play(UrlSource(url));
       } else {

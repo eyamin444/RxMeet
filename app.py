@@ -90,8 +90,6 @@ def ensure_firebase_initialized():
         print("Failed to initialize firebase_admin:", e)
         return False
 
-
-
 def _engine_from_env(url: str):
     if url.startswith("sqlite"):
         is_memory = ":memory:" in url or url.rstrip("/") in ("sqlite://", "sqlite:///:memory:")
@@ -2486,6 +2484,49 @@ def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), cu
     cl.status = "answered"
     db.commit()
     return {"ok": True, "call_log_id": cl.id}
+
+@app.post("/appointments/{appointment_id}/call/end", response_model=dict)
+def end_call(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user), call_log_id: Optional[int] = Body(None)):
+    """
+    Called by patient to decline or end a call. Will mark the call log (if provided)
+    and notify the doctor(s) of this appointment to end the call.
+    """
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # Security: only the patient or admin should call this (or doctor to end)
+    if not (current_user.role == UserRole.patient and appt.patient.user_id == current_user.id) and current_user.role != UserRole.admin and not (current_user.role == UserRole.doctor and appt.doctor.user_id == current_user.id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Mark call_log ended if provided
+    if call_log_id:
+        cl = db.get(CallLog, call_log_id)
+        if cl and cl.appointment_id == appointment_id:
+            cl.ended_at = datetime.utcnow()
+            cl.status = "ended"
+            db.commit()
+
+    # Notify doctor's device tokens to end call
+    try:
+        tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.doctor.user_id).all()
+        tokens = [t.token for t in tokens_q if t and t.token]
+        if tokens:
+            title = "Call ended"
+            body = f"Patient declined the call for appointment #{appt.id}"
+            data_payload = {"type": "video_end", "appointment_id": str(appt.id)}
+            # Build simple multicast message (works with older/newer firebase-admin)
+            multicast = messaging.MulticastMessage(
+                notification=messaging.Notification(title=title, body=body),
+                data={k: str(v) for k, v in data_payload.items()},
+                tokens=list(set(tokens))
+            )
+            res = messaging.send_multicast(multicast)
+            print(f"END_CALL: notified doctor tokens success={res.success_count} failed={res.failure_count}")
+    except Exception as e:
+        print("END_CALL: failed to notify doctor:", e)
+
+    return {"ok": True}
 
 
 @app.post("/appointments/{appointment_id}/video/token", response_model=dict)

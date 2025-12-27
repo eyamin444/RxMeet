@@ -85,6 +85,10 @@ class NotificationCenter {
   final _unread$ = StreamController<int>.broadcast();
   Stream<int> get unreadCountStream => _unread$.stream;
 
+  // New: broadcast stream to push notifications to listeners (UI)
+  final _push$ = StreamController<LocalNotice>.broadcast();
+  Stream<LocalNotice> get pushStream => _push$.stream;
+
   Future<List<LocalNotice>> _load() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_k);
@@ -206,6 +210,13 @@ class NotificationCenter {
           // ignore local notification errors
           print('NotificationCenter: notifications.show error: $e');
         }
+      }
+
+      // Emit the new notice to pushStream for immediate UI reaction
+      try {
+        _push$.add(next.first);
+      } catch (e) {
+        // ignore
       }
 
       // handle special call/type that should open IncomingCallPage for patients only
