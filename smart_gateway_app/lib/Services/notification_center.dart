@@ -1,4 +1,4 @@
-// lib/services/notification_center.dart
+// lib/Services/notification_center.dart
 import 'dart:async';
 import 'dart:convert';
 
@@ -78,6 +78,8 @@ class NotificationCenter {
   factory NotificationCenter() => _i;
 
   static const _k = 'local_notices_v1';
+  static const _kSeenMsgs = 'seen_message_ids';
+  static const _kSeenCalls = 'seen_call_ids';
 
   /// Serialize all mutations to avoid lost updates (e.g., delete racing with push).
   static Future<void> _lock = Future.value();
@@ -88,6 +90,11 @@ class NotificationCenter {
   // New: broadcast stream to push notifications to listeners (UI)
   final _push$ = StreamController<LocalNotice>.broadcast();
   Stream<LocalNotice> get pushStream => _push$.stream;
+
+  // in-memory cache for quick dedupe
+  final Set<String> _seenMessageIds = <String>{};
+  final Set<String> _seenCallIds = <String>{};
+  Set<String>? _openingCallIds;
 
   Future<List<LocalNotice>> _load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -112,6 +119,45 @@ class NotificationCenter {
       jsonEncode(dedup.map((e) => e.toMap()).toList()),
     );
     _unread$.add(dedup.where((e) => !e.read).length);
+  }
+
+  Future<void> _loadSeenCaches() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final msgs = prefs.getStringList(_kSeenMsgs) ?? <String>[];
+      final calls = prefs.getStringList(_kSeenCalls) ?? <String>[];
+      _seenMessageIds
+        ..clear()
+        ..addAll(msgs);
+      _seenCallIds
+        ..clear()
+        ..addAll(calls);
+      print('NotificationCenter: loaded ${_seenMessageIds.length} seenMsgs and ${_seenCallIds.length} seenCalls');
+    } catch (e) {
+      print('NotificationCenter: _loadSeenCaches error: $e');
+    }
+  }
+
+  Future<void> _saveSeenMessageId(String mid) async {
+    if (mid.isEmpty) return;
+    try {
+      _seenMessageIds.add(mid);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_kSeenMsgs, _seenMessageIds.toList());
+    } catch (e) {
+      print('NotificationCenter: _saveSeenMessageId error: $e');
+    }
+  }
+
+  Future<void> _saveSeenCallId(String cid) async {
+    if (cid.isEmpty) return;
+    try {
+      _seenCallIds.add(cid);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_kSeenCalls, _seenCallIds.toList());
+    } catch (e) {
+      print('NotificationCenter: _saveSeenCallId error: $e');
+    }
   }
 
   Future<int> unreadCount() async => (await _load()).where((e) => !e.read).length;
@@ -173,6 +219,23 @@ class NotificationCenter {
     _lock = _lock.then((_) async {
       final now = DateTime.now();
       final id = now.millisecondsSinceEpoch % 0x7fffffff;
+
+      // Dedup by message_id or call_log_id if provided
+      final prefs = await SharedPreferences.getInstance();
+      // message_id may be embedded in title/body/data as we call this from main.dart
+      // But callers (main.dart) do dedupe before calling NotificationCenter.push
+      // Still, we consider callLogId here to be safe.
+
+      if (callLogId != null) {
+        final cid = callLogId.toString();
+        if (_seenCallIds.contains(cid)) {
+          // already handled
+          print('NotificationCenter.push: duplicate callLogId suppressed: $cid');
+          return;
+        } else {
+          await _saveSeenCallId(cid);
+        }
+      }
 
       // Always re-load inside the lock to merge with latest state
       final list = await _load();
@@ -238,16 +301,41 @@ class NotificationCenter {
           }
 
           if (!isDoctor) {
-            // Open incoming call UI for patients only.
-            nav.push(MaterialPageRoute(
-              builder: (_) => IncomingCallPage(
-                appointmentId: appointmentId ?? 0,
-                room: room ?? '',
-                doctorName: title,
-                callLogId: callLogId,
-              ),
-            ));
-            // IncomingCallPage will start ringtone in its initState.
+            // If we have a callLogId, dedupe by it (prefer call-level dedupe).
+            final String? cid = callLogId != null ? callLogId.toString() : null;
+            if (cid != null) {
+              // If already seen/handled, skip
+              if (_seenCallIds.contains(cid)) {
+                print('NotificationCenter: incoming UI suppressed for duplicate callLogId $cid');
+                return;
+              }
+              // Mark seen BEFORE launching UI to avoid races that open multiple pages
+              await _saveSeenCallId(cid);
+            }
+
+            // Guard concurrent openings (in-memory)
+            final String guardKey = (callLogId != null) ? 'call_${callLogId}' : 'appt_${appointmentId ?? 0}';
+            _openingCallIds ??= <String>{};
+            if (_openingCallIds!.contains(guardKey)) {
+              print('NotificationCenter: already opening UI for $guardKey, skipping push');
+              return;
+            }
+            _openingCallIds!.add(guardKey);
+
+            try {
+              nav.push(MaterialPageRoute(
+                builder: (_) => IncomingCallPage(
+                  appointmentId: appointmentId ?? 0,
+                  room: room ?? '',
+                  doctorName: title,
+                  callLogId: callLogId,
+                ),
+              ));
+            } finally {
+              // remove guard after scheduling the push (keep seenCallIds persisted)
+              _openingCallIds!.remove(guardKey);
+            }
+
           } else {
             // Doctor: do not open incoming UI; log and keep local notice instead.
             print('NotificationCenter: doctor received call-notice; not opening IncomingCallPage.');
@@ -272,6 +360,19 @@ class NotificationCenter {
           print('NotificationCenter: failed to handle call UI: $e');
         }
       }
+
+      if (type == 'chat_message') {
+      // Show a toast notification; when user taps, open chat
+      // Show system local notification (small) - NotificationCenter already does that.
+      // Optionally auto-open chat if user is already in app and viewing that appointment
+      final nav = navigatorKey.currentState;
+      if (nav != null && /* optionally check current route */ false) {
+        // do not auto-open; instead push into pushStream so ChatScreen updates
+        _push$.add(next.first);
+      }
+    }
+
+
     });
     return _lock;
   }

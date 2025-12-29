@@ -1,7 +1,8 @@
 // lib/main.dart
+// Full file - paste to replace existing lib/main.dart
+
 import 'dart:async';
 import 'dart:convert';
-
 
 import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
@@ -11,7 +12,6 @@ import 'services/auth.dart';
 import 'models.dart';
 import 'widgets/snack.dart';
 import 'services/notification_center.dart';
-
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -32,13 +32,14 @@ import 'firebase_options.dart';
 import 'screens/admin/dashboard.dart' as admin show AdminDashboard;
 import 'screens/doctor/dashboard.dart' as doctor show DoctorDashboard;
 import 'screens/patient/dashboard.dart' as patient show PatientDashboard;
+import 'screens/chat/chat_screen.dart';
+
 
 // Incoming call UI and ringtone service (separate files)
 import 'screens/notifications/incoming_call.dart';
 import 'services/ringtone.dart';
 
 /// -----------------------
-/// Searchable markers:
 /// Use Ctrl+F with these tags:
 ///   - <<FCM_BACKGROUND_HANDLER>>
 ///   - <<INIT_NOTIFICATIONS>>
@@ -52,7 +53,59 @@ final FlutterLocalNotificationsPlugin notifications = FlutterLocalNotificationsP
 // Global navigator key so we can open incoming-call UI from background/handlers.
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
-/// <<FCM_BACKGROUND_HANDLER>>
+// Persisted dedupe key in SharedPreferences
+const String _kSeenMsgsKey = 'seen_message_ids';
+
+// Keep a small in-memory set of seen message ids to avoid double-notifying
+final Set<String> _seenMessageIds = <String>{};
+
+/// Load seen IDs from SharedPreferences into _seenMessageIds.
+Future<void> _loadSeenMessageIds() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList(_kSeenMsgsKey) ?? <String>[];
+    _seenMessageIds
+      ..clear()
+      ..addAll(list);
+    print('Loaded ${_seenMessageIds.length} seen message ids');
+  } catch (e) {
+    print('_loadSeenMessageIds error: $e');
+  }
+}
+
+/// Save a single message id into persistence and the in-memory set.
+Future<void> _saveSeenMessageId(String mid) async {
+  try {
+    if (mid.isEmpty) return;
+    _seenMessageIds.add(mid);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_kSeenMsgsKey, _seenMessageIds.toList());
+  } catch (e) {
+    print('_saveSeenMessageId error: $e');
+  }
+}
+
+/// Returns true if the message should be processed (i.e., NOT duplicate);
+/// If it is new we mark it persisted so subsequent deliveries are ignored.
+Future<bool> _shouldProcessMessage(RemoteMessage message) async {
+  try {
+    final mid = (message.data['message_id'] ?? message.messageId)?.toString() ?? '';
+    if (mid.isEmpty) return true; // can't dedupe without an id
+    // in-memory quick check
+    if (_seenMessageIds.contains(mid)) {
+      print('Duplicate message suppressed (in-memory): $mid');
+      return false;
+    }
+    // persist it
+    await _saveSeenMessageId(mid);
+    return true;
+  } catch (e) {
+    print('_shouldProcessMessage error: $e');
+    return true;
+  }
+}
+
+// <<FCM_BACKGROUND_HANDLER>>
 // Background handler must be a top-level function and reachable by the platform.
 // Use vm:entry-point to avoid tree-shaking in release builds.
 @pragma('vm:entry-point')
@@ -75,6 +128,28 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   // Lightweight log for debugging.
   print('FCM background: id=${message.messageId} data=${message.data}');
 
+  // Background dedupe must use SharedPreferences directly because this is a separate isolate.
+  try {
+    final String mid = (message.data['message_id'] ?? message.messageId)?.toString() ??
+        '${message.data['type'] ?? ''}_${message.data['appointment_id'] ?? ''}_${message.data['call_log_id'] ?? ''}_${message.data['room'] ?? ''}';
+    if (mid.isNotEmpty) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final seen = prefs.getStringList(_kSeenMsgsKey) ?? <String>[];
+        if (seen.contains(mid)) {
+          print('Background handler: duplicate message (ignored): $mid');
+          return;
+        }
+        seen.add(mid);
+        await prefs.setStringList(_kSeenMsgsKey, seen);
+      } catch (e) {
+        print('Background handler prefs dedupe error: $e');
+      }
+    }
+  } catch (e) {
+    print('Background dedupe failure: $e');
+  }
+
   // If this is a call notification, show a full-screen local notification so the
   // system can present the incoming-call UI (and play sound) even when app is backgrounded.
   try {
@@ -93,8 +168,7 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   }
 }
 
-
-/// <<INIT_NOTIFICATIONS>>
+// <<INIT_NOTIFICATIONS>>
 Future<void> initNotifications() async {
   const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
   // iOS initialization options can be added if needed.
@@ -105,42 +179,49 @@ Future<void> initNotifications() async {
   tz.setLocalLocation(tz.getLocation('Asia/Dhaka'));
 
   // Request permission for notifications on Android 13+ (and create channels)
+  final androidImpl =
+      notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  await androidImpl?.requestNotificationsPermission();
 
-final androidImpl =
-    notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-await androidImpl?.requestNotificationsPermission();
+  if (androidImpl != null) {
+    try {
+      await androidImpl.createNotificationChannel(const AndroidNotificationChannel(
+        'default_channel',
+        'General',
+        description: 'General notifications',
+        importance: Importance.defaultImportance,
+      ));
 
-if (androidImpl != null) {
-  try {
-    await androidImpl.createNotificationChannel(const AndroidNotificationChannel(
-      'default_channel',
-      'General',
-      description: 'General notifications',
-      importance: Importance.defaultImportance,
-    ));
-
-    // Calls channel with custom native sound
-    final callsChannel = AndroidNotificationChannel(
-      'calls_channel',
-      'Incoming Calls',
-      description: 'Incoming call notifications',
-      importance: Importance.max,
-      sound: RawResourceAndroidNotificationSound('telehealth_incoming_ringtone'),
-      playSound: true,
-    );
-    await androidImpl.createNotificationChannel(callsChannel);
-
-  } catch (e) {
-    print('createNotificationChannel error: $e');
+      // Calls channel with custom native sound
+      final callsChannel = AndroidNotificationChannel(
+        'calls_channel',
+        'Incoming Calls',
+        description: 'Incoming call notifications',
+        importance: Importance.max,
+        sound: RawResourceAndroidNotificationSound('telehealth_incoming_ringtone'),
+        playSound: true,
+      );
+      await androidImpl.createNotificationChannel(callsChannel);
+    } catch (e) {
+      print('createNotificationChannel error: $e');
+    }
   }
-}
-
 }
 
 Future<void> _showLocalNotification(RemoteMessage message, {bool isCall = false}) async {
   final data = message.data;
   final title = message.notification?.title ?? data['title'] ?? (isCall ? 'Incoming call' : 'Notification');
   final body = message.notification?.body ?? data['body'] ?? '';
+
+  // dedupe by message id or a fallback key (protect local notifications too)
+  final mid = (message.data['message_id'] ?? message.messageId)?.toString() ??
+      '${data['type'] ?? ''}_${data['appointment_id'] ?? ''}_${data['call_log_id'] ?? ''}_${data['room'] ?? ''}';
+  if (mid.isNotEmpty && _seenMessageIds.contains(mid)) {
+    // already handled in this runtime (background handler persistence already added it)
+    return;
+  }
+  // mark it so we don't show duplicates across runtime
+  if (mid.isNotEmpty) await _saveSeenMessageId(mid);
 
   final androidDetails = AndroidNotificationDetails(
     isCall ? 'calls_channel' : 'default_channel',
@@ -158,12 +239,9 @@ Future<void> _showLocalNotification(RemoteMessage message, {bool isCall = false}
 
   final details = NotificationDetails(android: androidDetails);
   final id = DateTime.now().microsecond;
-
-  // Use JSON payload so the UI can parse it reliably on tap/open
   final payload = jsonEncode(data);
   await notifications.show(id, title, body, details, payload: payload);
 }
-
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -221,184 +299,198 @@ class _BootstrapState extends State<_Bootstrap> {
     _bootstrap();
   }
 
-Future<void> _bootstrap() async {
-  try {
-    me = await AuthService.whoAmI();
-  } catch (_) {
-    me = null;
-  }
-
-  // If logged-in patient, show ringtone unlock prompt once (web)
-  if (me != null && me!.role == 'patient') {
-    final prefs = await SharedPreferences.getInstance();
-    final unlocked = prefs.getBool('ringtone_unlocked') ?? false;
-    if (!unlocked) {
-      // call after frame so app is ready
-      WidgetsBinding.instance.addPostFrameCallback((_) => _showEnableRingtoneDialog());
-    }
-  }
-
-  // <<FCM_TOKEN_REGISTER>>
-  // Register FCM token and message handlers ONLY for patients.
-  if (me != null && me!.role == 'patient') {
-    // Android 13+ runtime notification permission
-    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
-      try {
-        var status = await Permission.notification.status;
-        if (status.isDenied || status.isLimited || status.isPermanentlyDenied) {
-          await Permission.notification.request();
-        }
-      } catch (e) {
-        print('Permission.request error: $e');
-      }
-    } else if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
-      // iOS request
-      await FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
-    } else if (kIsWeb) {
-      // For web, nothing automatic; token can still require vapidKey depending on configuration.
-    }
-
-    // Get token (try plain, and fallback with vapidKey if web requires it)
+  Future<void> _bootstrap() async {
     try {
-      String? token;
-      try {
-        token = await FirebaseMessaging.instance.getToken();
-      } catch (e) {
-        // fallback: some web setups require vapidKey
-        try {
-          final webOpts = DefaultFirebaseOptions.web;
-          final dynamic maybeVapid = webOpts != null ? (webOpts as dynamic).vapidKey : null;
-          if (kIsWeb && maybeVapid != null) {
-            token = await FirebaseMessaging.instance.getToken(vapidKey: maybeVapid as String);
-          }
-        } catch (_) {
-          // ignore
-        }
-      }
-
-      if (token != null && token.isNotEmpty) {
-        await Api.post('/me/device_token', data: {'token': token, 'platform': kIsWeb ? 'web' : 'android'});
-        print('FCM token sent to server: $token');
-      } else {
-        print('FCM getToken returned null/empty');
-      }
-    } catch (e) {
-      print('Failed to obtain/send FCM token: $e');
+      me = await AuthService.whoAmI();
+    } catch (_) {
+      me = null;
     }
 
-    // Listen for token refresh
-    FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
-      try {
-        await Api.post('/me/device_token', data: {'token': newToken});
-        print('FCM refreshed token sent: $newToken');
-      } catch (e) {
-        print('Failed to send refreshed FCM token: $e');
+    // Load persisted seen message ids before registering handlers so dedupe is effective immediately
+    await _loadSeenMessageIds();
+
+    // If logged-in patient, show ringtone unlock prompt once (web)
+    if (me != null && me!.role == 'patient') {
+      final prefs = await SharedPreferences.getInstance();
+      final unlocked = prefs.getBool('ringtone_unlocked') ?? false;
+      if (!unlocked) {
+        // call after frame so app is ready
+        WidgetsBinding.instance.addPostFrameCallback((_) => _showEnableRingtoneDialog());
       }
-    });
+    }
 
-    // <<FCM_MESSAGE_HANDLERS>>
-    // Foreground messages
-    FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+    // <<FCM_TOKEN_REGISTER>>
+    // Register FCM token and message handlers ONLY for patients.
+    if (me != null && me!.role == 'patient') {
+      // Android 13+ runtime notification permission
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        try {
+          var status = await Permission.notification.status;
+          if (status.isDenied || status.isLimited || status.isPermanentlyDenied) {
+            await Permission.notification.request();
+          }
+        } catch (e) {
+          print('Permission.request error: $e');
+        }
+      } else if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        // iOS request
+        await FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
+      } else if (kIsWeb) {
+        // For web, nothing automatic; token can still require vapidKey depending on configuration.
+      }
+
+      // Get token (try plain, and fallback with vapidKey if web requires it)
       try {
-        final data = message.data;
-        print('FCM onMessage: ${data} notification=${message.notification}');
+        String? token;
+        try {
+          token = await FirebaseMessaging.instance.getToken();
+        } catch (e) {
+          // fallback: some web setups require vapidKey
+          try {
+            final webOpts = DefaultFirebaseOptions.web;
+            final dynamic maybeVapid = webOpts != null ? (webOpts as dynamic).vapidKey : null;
+            if (kIsWeb && maybeVapid != null) {
+              token = await FirebaseMessaging.instance.getToken(vapidKey: maybeVapid as String);
+            }
+          } catch (_) {
+            // ignore
+          }
+        }
 
-        // If this is a doctor_call / video_ready, open IncomingCallPage only for patients
-        // Use the 'me' we loaded above in _bootstrap().
-        final isDoctor = me?.role == 'doctor';
+        if (token != null && token.isNotEmpty) {
+          await Api.post('/me/device_token', data: {'token': token, 'platform': kIsWeb ? 'web' : 'android'});
+          print('FCM token sent to server: $token');
+        } else {
+          print('FCM getToken returned null/empty');
+        }
+      } catch (e) {
+        print('Failed to obtain/send FCM token: $e');
+      }
 
-        if (data['type'] == 'doctor_call' || data['type'] == 'video_ready') {
-          if (!isDoctor) {
-            // Show incoming call page for patient; IncomingCallPage will play ringtone in initState
-            navigatorKey.currentState?.push(
-              MaterialPageRoute(
-                builder: (_) => IncomingCallPage(
-                  appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
-                  room: data['room'] ?? '',
-                  doctorName: data['doctor_name'] ?? '',
-                  callLogId: data.containsKey('call_log_id')
-                      ? int.tryParse(data['call_log_id'] ?? '')
-                      : null,
-                ),
-              ),
+      // Listen for token refresh
+      FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
+        try {
+          await Api.post('/me/device_token', data: {'token': newToken});
+          print('FCM refreshed token sent: $newToken');
+        } catch (e) {
+          print('Failed to send refreshed FCM token: $e');
+        }
+      });
+
+      // <<FCM_MESSAGE_HANDLERS>>
+      // Foreground messages
+      FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+        try {
+          final data = message.data;
+          print('FCM onMessage: ${data} notification=${message.notification}');
+
+          // Dedupe using persisted mechanism
+          if (!await _shouldProcessMessage(message)) {
+            return;
+          }
+
+          final type = (data['type'] ?? '').toString();
+
+          if (type == 'doctor_call' || type == 'video_ready') {
+            // Push into NotificationCenter and let NotificationCenter open IncomingCallPage (deduped).
+            await NotificationCenter().push(
+              title: message.notification?.title ?? data['doctor_name'] ?? 'Incoming call',
+              body: message.notification?.body ?? 'Incoming call',
+              type: type,
+              appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
+              room: data['room'],
+              callLogId: data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null,
+              alsoShowSystemToast: false, // avoid duplicate system toast when showing UI
+            );
+          } else if (type == 'call_end' || type == 'video_end' || type == 'missed_call') {
+            // notify app that call ended — this will close incoming UI if open.
+            await NotificationCenter().push(
+              title: message.notification?.title ?? (type == 'missed_call' ? 'Missed call' : 'Call ended'),
+              body: message.notification?.body ?? '',
+              type: type,
+              appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
+              alsoShowSystemToast: false,
+            );
+          } else if (type == 'participant_joined') {
+            // inform doctor UI that participant joined (useful for doctor side)
+            await NotificationCenter().push(
+              title: message.notification?.title ?? 'Participant joined',
+              body: message.notification?.body ?? 'Participant joined the call',
+              type: type,
+              appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
+              alsoShowSystemToast: false,
             );
           } else {
-            // For doctors, show a small local non-intrusive toast
-            await NotificationCenter().push(
-              title: 'Doctor is ready (local)',
-              body: 'Call initiated — patient will be notified',
-              type: 'info',
-              appointmentId: int.tryParse(data['appointment_id'] ?? '') ?? 0,
-              alsoShowSystemToast: true,
-            );
+            // generic notification
+            await _showLocalNotification(message, isCall: false);
           }
-        } else {
-          // Non-call notification: show local notification
-          await _showLocalNotification(message, isCall: false);
+        } catch (e, st) {
+          print('Error handling onMessage: $e\n$st');
         }
-      } catch (e, st) {
-        print('Error handling onMessage: $e\n$st');
-      }
-    });
+      });
 
-    // When user taps notification and app opens from background
-    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) async {
+      // When user taps notification and app opens from background
+      FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) async {
+        try {
+          // Dedupe before responding to user tap
+          if (!await _shouldProcessMessage(message)) {
+            return;
+          }
+
+          final data = message.data;
+          print('FCM onMessageOpenedApp: ${data}');
+          final type = (data['type'] ?? '').toString();
+          if (type == 'doctor_call' || type == 'video_ready') {
+            final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
+            navigatorKey.currentState?.push(MaterialPageRoute(
+              builder: (_) => IncomingCallPage(
+                appointmentId: apptId,
+                room: data['room'] ?? '',
+                doctorName: data['doctor_name'] ?? 'Doctor',
+                callLogId: data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null,
+              ),
+            ));
+          } else {
+            await _showLocalNotification(message, isCall: false);
+          }
+        } catch (e) {
+          print('Error in onMessageOpenedApp handler: $e');
+        }
+      });
+
+      // App launched from terminated state via a notification
       try {
-        final data = message.data;
-        print('FCM onMessageOpenedApp: ${data}');
-        if (data['type'] == 'doctor_call') {
-          final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
-          final room = data['room'] ?? '';
-          final doctorName = data['doctor_name'] ?? 'Doctor';
-          final callLogId = data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null;
-
-          navigatorKey.currentState?.push(MaterialPageRoute(
-            builder: (_) => IncomingCallPage(
-              appointmentId: apptId,
-              room: room,
-              doctorName: doctorName,
-              callLogId: callLogId,
-            ),
-          ));
-        } else {
-          await _showLocalNotification(message, isCall: false);
+        final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
+        if (initialMessage != null) {
+          // Dedupe/guard initialMessage too
+          if (await _shouldProcessMessage(initialMessage)) {
+            if ((initialMessage.data['type'] ?? '') == 'doctor_call') {
+              final data = initialMessage.data;
+              final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                navigatorKey.currentState?.push(MaterialPageRoute(
+                  builder: (_) => IncomingCallPage(
+                    appointmentId: apptId,
+                    room: data['room'] ?? '',
+                    doctorName: data['doctor_name'] ?? 'Doctor',
+                    callLogId: data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null,
+                  ),
+                ));
+              });
+            } else {
+              // Not a call; optionally show a notification
+              await _showLocalNotification(initialMessage, isCall: false);
+            }
+          }
         }
       } catch (e) {
-        print('Error in onMessageOpenedApp handler: $e');
+        print('Error handling initialMessage: $e');
       }
-    });
+    } // end if patient
 
-    // App launched from terminated state via a notification
-    try {
-      final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
-      if (initialMessage != null && initialMessage.data['type'] == 'doctor_call') {
-        final data = initialMessage.data;
-        final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
-        final room = data['room'] ?? '';
-        final doctorName = data['doctor_name'] ?? 'Doctor';
-        final callLogId = data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null;
+    if (mounted) setState(() => loading = false);
+  } // end _bootstrap
 
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          navigatorKey.currentState?.push(MaterialPageRoute(
-            builder: (_) => IncomingCallPage(
-              appointmentId: apptId,
-              room: room,
-              doctorName: doctorName,
-              callLogId: callLogId,
-            ),
-          ));
-        });
-      }
-    } catch (e) {
-      print('Error handling initialMessage: $e');
-    }
-  } // end if patient
-
-  if (mounted) setState(() => loading = false);
-}
-
-  /// <<RINGTONE_UNLOCK_PROMPT>>
-  /// This dialog is shown to web patients once to allow autoplay (tiny unlock play).
   Future<void> _showEnableRingtoneDialog() async {
     final ctx = navigatorKey.currentContext;
     if (ctx == null) return;
@@ -556,6 +648,9 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 }
+
+/// The rest of your RegisterPage, AppointmentDetailPage, etc., unchanged from your previous main.dart.
+/// You can keep the same implementations you had for RegisterPage and AppointmentDetailPage.
 
 class RegisterPage extends StatefulWidget {
   const RegisterPage({super.key});

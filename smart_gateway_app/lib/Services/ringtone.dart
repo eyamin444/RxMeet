@@ -9,8 +9,10 @@ class RingtoneService {
   static Future<void> init() async {
     if (_inited) return;
     _inited = true;
+    // Nothing else now — unlockAudioOnce does the temporary play to acquire audio.
   }
 
+  /// Do a short quiet play to unlock audio autoplay policies (especially on web).
   static Future<void> unlockAudioOnce() async {
     try {
       await _player.setReleaseMode(ReleaseMode.stop);
@@ -29,6 +31,7 @@ class RingtoneService {
     }
   }
 
+  /// Play the ringtone in a loop (for the incoming call UI).
   static Future<void> playLooping() async {
     try {
       await _player.setReleaseMode(ReleaseMode.loop);

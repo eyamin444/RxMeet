@@ -51,6 +51,10 @@ class _VideoScreenState extends State<VideoScreen> {
   // When true we NEVER show the Join button again.
   bool _callEnded = false;
 
+  // NEW: call_log_id for this active call (populated for doctor from start_call response,
+  // and for patient from incoming push / join payload)
+  int? _callLogId;
+
   @override
   void initState() {
     super.initState();
@@ -62,6 +66,17 @@ class _VideoScreenState extends State<VideoScreen> {
 
     // Start async auto-join once token arrives
     _future!.then((data) {
+      // If server provided call_log_id in the join payload, keep it
+      try {
+        if (data.containsKey('call_log_id') && data['call_log_id'] != null) {
+          final cid = data['call_log_id'].toString();
+          _callLogId = int.tryParse(cid);
+          print('VideoScreen: loaded call_log_id from join payload: $_callLogId');
+        }
+      } catch (e) {
+        print('VideoScreen: error parsing call_log_id from payload: $e');
+      }
+
       // auto-join once token is available
       if (!_autoJoinStarted && !_callEnded) {
         _autoJoinStarted = true;
@@ -105,7 +120,7 @@ class _VideoScreenState extends State<VideoScreen> {
 
   Future<Map<String, dynamic>> _loadJoinPayload() async {
     if (!Api.isReady) await Api.init();
-    // joinVideo returns {ok:true, url:..., token:...}
+    // joinVideo returns {ok:true, url:..., token:..., maybe call_log_id}
     return Api.joinVideo(widget.appointmentId);
   }
 
@@ -173,10 +188,21 @@ class _VideoScreenState extends State<VideoScreen> {
       try {
         print(
             'VIDEO_SCREEN: doctor connecting -> will notify backend for appt ${widget.appointmentId}');
-        final resp =
-            await Api.post('/appointments/${widget.appointmentId}/call/start',
-                data: {});
+        final resp = await Api.post('/appointments/${widget.appointmentId}/call/start', data: {});
         print('VIDEO_SCREEN: backend call/start response: $resp');
+
+        // IMPORTANT: store call_log_id returned by start_call so we can end the exact call
+        if (resp != null && resp is Map && resp.containsKey('call_log_id')) {
+          try {
+            final cid = resp['call_log_id']?.toString();
+            if (cid != null && cid.isNotEmpty) {
+              _callLogId = int.tryParse(cid);
+              print('VideoScreen: stored call_log_id from start_call: $_callLogId');
+            }
+          } catch (e) {
+            print('VideoScreen: error parsing call_log_id from start response: $e');
+          }
+        }
       } catch (e, st) {
         // If backend call fails, still keep the room connected but log & push local notice
         print('VIDEO_SCREEN: Failed to notify backend to start call: $e');
@@ -266,15 +292,17 @@ class _VideoScreenState extends State<VideoScreen> {
 
   Future<void> _handlePushNotice(LocalNotice notice) async {
     try {
+      // If some other part of the app or server ends the call, server will send video_end
       if (notice.type == 'video_end' &&
           notice.appointmentId == widget.appointmentId) {
         print('VideoScreen: received video_end for appt ${notice.appointmentId}');
-        // Stop timers and disconnect room
-        _callTimer?.cancel();
-        _participantWatcher?.cancel();
 
         // Mark call ended so UI will not allow re-join
         _callEnded = true;
+
+        // Stop timers and disconnect room
+        _callTimer?.cancel();
+        _participantWatcher?.cancel();
 
         if (_room != null) {
           try {
@@ -295,6 +323,15 @@ class _VideoScreenState extends State<VideoScreen> {
             const SnackBar(content: Text('Call ended')),
           );
         }
+
+        // If screen still open, pop back after small delay to let UI settle
+        Future.delayed(const Duration(milliseconds: 300), () {
+          if (mounted) {
+            try {
+              Navigator.of(context).maybePop();
+            } catch (_) {}
+          }
+        });
       }
     } catch (e) {
       print('VideoScreen: _handlePushNotice error: $e');
@@ -321,6 +358,17 @@ class _VideoScreenState extends State<VideoScreen> {
 
           final wsUrl = data['url'] as String;
           final token = data['token'] as String;
+
+          // If join payload included call_log_id for patient, store it
+          try {
+            if (_callLogId == null && data.containsKey('call_log_id') && data['call_log_id'] != null) {
+              final cid = data['call_log_id'].toString();
+              _callLogId = int.tryParse(cid);
+              print('VideoScreen: received call_log_id from join payload: $_callLogId');
+            }
+          } catch (e) {
+            print('VideoScreen: error parsing call_log_id from join payload (build): $e');
+          }
 
           // ================= PRE JOIN (we auto-join) =================
           if (_room == null) {
@@ -391,8 +439,8 @@ class _VideoScreenState extends State<VideoScreen> {
                           await _connect(wsUrl, token);
                         } catch (e) {
                           if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text('Failed to join: $e')));
+                            ScaffoldMessenger.of(context)
+                                .showSnackBar(SnackBar(content: Text('Failed to join: $e')));
                           }
                         } finally {
                           if (mounted) setState(() => _connecting = false);
@@ -452,8 +500,8 @@ class _VideoScreenState extends State<VideoScreen> {
                 right: 0,
                 child: Center(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 6),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                     decoration: BoxDecoration(
                       color: Colors.black54,
                       borderRadius: BorderRadius.circular(20),
@@ -483,8 +531,7 @@ class _VideoScreenState extends State<VideoScreen> {
                       borderRadius: BorderRadius.circular(12),
                       child: Container(
                         decoration: BoxDecoration(
-                          border:
-                              Border.all(color: Colors.white, width: 2),
+                          border: Border.all(color: Colors.white, width: 2),
                         ),
                         child: _videoTile(localVideo, mirror: true),
                       ),
@@ -512,8 +559,7 @@ class _VideoScreenState extends State<VideoScreen> {
                           ),
                           onPressed: () async {
                             final lp = _room!.localParticipant!;
-                            await lp.setMicrophoneEnabled(
-                                !lp.isMicrophoneEnabled());
+                            await lp.setMicrophoneEnabled(!lp.isMicrophoneEnabled());
                             setState(() {});
                           },
                         ),
@@ -526,8 +572,7 @@ class _VideoScreenState extends State<VideoScreen> {
                           ),
                           onPressed: () async {
                             final lp = _room!.localParticipant!;
-                            await lp.setCameraEnabled(
-                                !lp.isCameraEnabled());
+                            await lp.setCameraEnabled(!lp.isCameraEnabled());
                             setState(() {});
                           },
                         ),
@@ -537,10 +582,15 @@ class _VideoScreenState extends State<VideoScreen> {
                             _callTimer?.cancel();
 
                             // Notify server that this side ended the call so server
-                            // can notify the other party.
+                            // can notify the other party. Include call_log_id when available.
                             try {
                               if (Api.isReady == false) await Api.init();
-                              await Api.post('/appointments/${widget.appointmentId}/call/end');
+                              final body = <String, dynamic>{};
+                              if (_callLogId != null) {
+                                body['call_log_id'] = _callLogId.toString();
+                              }
+                              await Api.post('/appointments/${widget.appointmentId}/call/end',
+                                  data: body);
                             } catch (e) {
                               print('VideoScreen: failed to notify server call/end: $e');
                             }
@@ -563,6 +613,11 @@ class _VideoScreenState extends State<VideoScreen> {
                               print('VideoScreen: error disconnecting: $e');
                             }
                             setState(() => _room = null);
+
+                            // pop back after small delay
+                            Future.delayed(const Duration(milliseconds: 200), () {
+                              if (mounted) Navigator.of(context).maybePop();
+                            });
                           },
                         ),
                       ],

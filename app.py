@@ -47,6 +47,10 @@ import os
 import firebase_admin
 from firebase_admin import credentials, messaging
 
+import threading
+import time
+
+
 FIREBASE_CREDENTIAL_PATH = os.getenv("FIREBASE_CREDENTIAL_PATH", "D:\\SmartGateway\\firebase-service-account.json")
 
 def ensure_firebase_initialized():
@@ -374,8 +378,21 @@ class CallLog(Base):
     answered_at = Column(DateTime, nullable=True)
     ended_at = Column(DateTime, nullable=True)
     duration = Column(Integer, nullable=True)  # seconds
-    status = Column(String, default="ringing")  # ringing | answered | ended | missed
+    status = Column(String, default="ringing")  
 
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False, index=True)
+    sender_user_id = Column(Integer, nullable=False, index=True)
+    recipient_user_id = Column(Integer, nullable=True, index=True)  # optional, convenience
+    body = Column(Text, default="", nullable=False)
+    kind = Column(String, default="text")  # text | system | media | etc.
+    read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    # Relationship (optional)
+    appointment = relationship("Appointment")
 
 # -----------------------------------------------------------------------------
 # SQLite additive auto-migrations (adds columns safely)
@@ -594,6 +611,169 @@ def gen_slots_for_date(db: Session, doctor_id: int, day: dt_date) -> List[dateti
     for a in avails:
         _append_by_hours(a.start_hour, a.end_hour)
     return out
+
+# ---------- <<CALL_TIMEOUT_AND_INTERNAL_END>> ----------
+def _notify_end_call_tokens(db: Session, tokens: List[str], appt_id: int, cl: Optional[CallLog], title: str, body: str):
+    """Notify tokens with a standardized video_end payload."""
+    try:
+        if not tokens:
+            return
+        payload = {"type": "video_end", "appointment_id": str(appt_id)}
+        if cl:
+            payload["call_log_id"] = str(cl.id)
+            payload["message_id"] = f"call_{cl.id}_end"
+        multicast = messaging.MulticastMessage(
+            notification=messaging.Notification(title=title, body=body),
+            data={k: str(v) for k, v in payload.items()},
+            tokens=list(set(tokens)),
+        )
+        res = messaging.send_multicast(multicast)
+        print(f"_notify_end_call_tokens: sent success={res.success_count} failed={res.failure_count}")
+    except Exception as e:
+        print("_notify_end_call_tokens: error:", e)
+
+def _notify_chat_message(db: Session, appointment: Appointment, message_row: Message):
+    """
+    Send a data-only FCM message to the other party for the given message.
+    Payload contains message_id, appointment_id, sender_id, body and type=chat_message.
+    """
+    try:
+        # find recipient: if message_row.recipient_user_id provided use it,
+        # else compute as the other user on the appointment
+        recipient_id = message_row.recipient_user_id
+        if not recipient_id:
+            # appointment.patient.user_id and appointment.doctor.user_id exist
+            if appointment.patient and appointment.patient.user_id == message_row.sender_user_id:
+                recipient_id = appointment.doctor.user_id
+            elif appointment.doctor and appointment.doctor.user_id == message_row.sender_user_id:
+                recipient_id = appointment.patient.user_id
+            else:
+                # As fallback, send to both
+                recipient_id = None
+
+        tokens = []
+        if recipient_id:
+            tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == recipient_id).all()
+            tokens = [t.token for t in tokens_q if t and t.token]
+        else:
+            # fallback: notify both sides
+            dr = db.query(DeviceToken).filter(DeviceToken.user_id == appointment.patient.user_id).all()
+            pr = db.query(DeviceToken).filter(DeviceToken.user_id == appointment.doctor.user_id).all()
+            tokens = [t.token for t in (dr + pr) if t and t.token]
+
+        if not tokens:
+            return
+
+        data_payload = {
+            "type": "chat_message",
+            "appointment_id": str(appointment.id),
+            "message_id": str(message_row.id),
+            "sender_id": str(message_row.sender_user_id),
+            "body": (message_row.body or "")[:1000],  # keep small
+        }
+        fcm_send_data_tokens(db, tokens, data_payload, ttl_seconds=3600)
+    except Exception as e:
+        print("_notify_chat_message error:", e)
+
+def _end_call_internal(db: Session, appointment_id: int, call_log_id: Optional[int] = None, reason: str = "ended", by: Optional[str] = None):
+    """
+    Internal helper to mark CallLog ended and notify both doctor and patient.
+    Idempotent: safe to call multiple times.
+    """
+    try:
+        appt = db.get(Appointment, appointment_id)
+        if not appt:
+            print(f"_end_call_internal: appointment {appointment_id} not found")
+            return False
+
+        cl = None
+        if call_log_id:
+            cl = db.get(CallLog, call_log_id)
+            if not cl or cl.appointment_id != appointment_id:
+                cl = None
+
+        # If no call_log provided, try to find the most recent
+        if not cl:
+            cl = (
+                db.query(CallLog)
+                .filter(CallLog.appointment_id == appointment_id)
+                .order_by(CallLog.started_at.desc())
+                .first()
+            )
+
+        if cl:
+            if not cl.ended_at:
+                cl.ended_at = datetime.utcnow()
+                cl.status = "missed" if reason == "missed" else "ended"
+                # compute duration if answered
+                try:
+                    if cl.answered_at and cl.started_at:
+                        cl.duration = int((cl.ended_at - cl.answered_at).total_seconds())
+                except Exception:
+                    pass
+                db.commit()
+        else:
+            # no call log found: nothing to update in DB, but we still notify tokens
+            pass
+
+        # Notify doctor and patient tokens
+        try:
+            dr_tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.doctor.user_id).all()
+            dr_tokens = [t.token for t in dr_tokens_q if t and t.token]
+            _notify_end_call_tokens(db, dr_tokens, appointment_id, cl, "Call ended", f"Call ended for appointment #{appointment_id}")
+        except Exception as e:
+            print("_end_call_internal: failed to notify doctor tokens:", e)
+
+        try:
+            p_tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.patient.user_id).all()
+            p_tokens = [t.token for t in p_tokens_q if t and t.token]
+            _notify_end_call_tokens(db, p_tokens, appointment_id, cl, "Call ended", f"Call ended for appointment #{appointment_id}")
+        except Exception as e:
+            print("_end_call_internal: failed to notify patient tokens:", e)
+
+        return True
+    except Exception as e:
+        print("_end_call_internal error:", e)
+        db.rollback()
+        return False
+
+
+def schedule_call_timeout(appointment_id: int, call_log_id: int, timeout_seconds: int = 60):
+    """
+    Schedule a background Timer to auto-end the call if it remains ringing for timeout_seconds.
+    This uses a separate DB session per timer.
+    """
+    def _worker(appt_id: int, cl_id: int, tsec: int):
+        try:
+            print(f"SCHEDULE_CALL_TIMEOUT: sleeping {tsec}s for appt={appt_id} cl={cl_id}")
+            time.sleep(tsec)
+            db = SessionLocal()
+            try:
+                cl = db.get(CallLog, cl_id)
+                if not cl:
+                    print(f"SCHEDULE_CALL_TIMEOUT: call_log {cl_id} missing (already ended?)")
+                    return
+                # Only end if still ringing (no answered_at and no ended_at)
+                if cl.ended_at:
+                    print(f"SCHEDULE_CALL_TIMEOUT: call_log {cl_id} already ended at {cl.ended_at}")
+                    return
+                # If already answered, do not mark missed
+                if cl.answered_at:
+                    print(f"SCHEDULE_CALL_TIMEOUT: call_log {cl_id} already answered at {cl.answered_at}")
+                    return
+                # Mark as missed through internal end helper
+                print(f"SCHEDULE_CALL_TIMEOUT: auto-ending call_log {cl_id} (missed)")
+                _end_call_internal(db, appt_id, cl_id, reason="missed", by="system")
+            finally:
+                db.close()
+        except Exception as ex:
+            print("SCHEDULE_CALL_TIMEOUT: worker error:", ex)
+
+    t = threading.Thread(target=_worker, args=(appointment_id, call_log_id, timeout_seconds), daemon=True)
+    t.start()
+    print(f"SCHEDULE_CALL_TIMEOUT: scheduled for appt={appointment_id} cl={call_log_id} in {timeout_seconds}s")
+# ---------- <<END CALL_TIMEOUT_AND_INTERNAL>> ----------
+
 
 # ---- block helpers (new) -----------------------------------------------------
 def _overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
@@ -2322,8 +2502,17 @@ def create_video_room(appointment_id: int, current: User = Depends(get_current_u
         db.commit()
     return {"ok": True, "room": appt.video_room}
 
+# ---------- <<START_CALL_PATCH>> ----------
 @app.post("/appointments/{appointment_id}/call/start")
 def start_call(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Doctor starts a call. Create a CallLog and send a doctor_call push to the patient.
+    The push carries:
+      - appointment_id
+      - call_log_id
+      - message_id (unique for this call instance)
+      - doctor_name, room
+    """
     # Ensure firebase is initialized in this worker/process
     if not ensure_firebase_initialized():
         raise HTTPException(status_code=500, detail="Server firebase not initialized")
@@ -2341,12 +2530,24 @@ def start_call(appointment_id: int, db: Session = Depends(get_db), current_user:
     if not getattr(appt, "patient", None) or not getattr(appt.patient, "user_id", None):
         raise HTTPException(status_code=400, detail="Appointment patient information missing")
 
-    # List tokens
+    # Create call log record so we can trace/answer/end this call (idempotent per start)
+    cl = CallLog(appointment_id=appointment_id,
+                 started_by_user_id=current_user.id,
+                 started_at=datetime.utcnow(),
+                 status="ringing")
+    db.add(cl)
+    db.commit()
+    db.refresh(cl)
+
+    # message_id used for client dedupe
+    message_id = f"call_{cl.id}_{secrets.token_urlsafe(6)}"
+
+    # Get patient tokens
     tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.patient.user_id).all()
     tokens = list({t.token for t in tokens_q if t and t.token})
     print(f"START_CALL: found {len(tokens)} tokens for patient_user_id={appt.patient.user_id}")
     if not tokens:
-        return {"ok": True, "sent": 0, "failed": 0, "errors": []}
+        return {"ok": True, "sent": 0, "failed": 0, "errors": [], "call_log_id": cl.id, "message_id": message_id}
 
     title = f"{(appt.doctor.user.name if appt.doctor and appt.doctor.user else 'Doctor')} is calling"
     body = "Tap to answer the call"
@@ -2354,10 +2555,12 @@ def start_call(appointment_id: int, db: Session = Depends(get_db), current_user:
         "type": "doctor_call",
         "appointment_id": str(appt.id),
         "doctor_name": (appt.doctor.user.name if appt.doctor and appt.doctor.user else "Doctor"),
-        "room": (appt.video_room or f"room_{appt.id}")
+        "room": (appt.video_room or f"room_{appt.id}"),
+        "call_log_id": str(cl.id),
+        "message_id": message_id,   # for client dedupe
     }
 
-    # Build optional platform configs if available (guarded)
+    # Platform configs
     android_cfg = None
     try:
         if hasattr(messaging, "AndroidConfig") and hasattr(messaging, "AndroidNotification"):
@@ -2404,9 +2607,9 @@ def start_call(appointment_id: int, db: Session = Depends(get_db), current_user:
 
     success = 0
     failed = 0
-    errors = []  # collect {token, error}
+    errors = []
 
-    # Try send_multicast if available
+    # Try multicast
     if hasattr(messaging, "send_multicast") and hasattr(messaging, "MulticastMessage"):
         try:
             multicast = messaging.MulticastMessage(
@@ -2425,19 +2628,18 @@ def start_call(appointment_id: int, db: Session = Depends(get_db), current_user:
                 if not resp.success:
                     err = str(resp.exception) if resp.exception else "unknown"
                     errors.append({"token": multicast.tokens[i], "error": err})
-                    # prune invalid tokens
                     if "Unregistered" in err or "not registered" in err or "registration-token-not-registered" in err:
                         try:
                             db.query(DeviceToken).filter(DeviceToken.token == multicast.tokens[i]).delete()
                             db.commit()
                         except Exception:
                             db.rollback()
-            return {"ok": True, "sent": success, "failed": failed, "errors": errors}
+            return {"ok": True, "sent": success, "failed": failed, "errors": errors, "call_log_id": cl.id, "message_id": message_id}
         except Exception as e:
             print("START_CALL: send_multicast failed, falling back:", e)
             traceback.print_exc()
 
-    # Per-token fallback
+    # Fallback: per-token send
     for t in tokens:
         try:
             msg_kwargs = {"data": {k: str(v) for k, v in data_payload.items()}, "token": t}
@@ -2463,10 +2665,24 @@ def start_call(appointment_id: int, db: Session = Depends(get_db), current_user:
             continue
 
     print(f"START_CALL: per-token send result: success={success}, failed={failed}")
-    return {"ok": True, "sent": success, "failed": failed, "errors": errors}
+    return {"ok": True, "sent": success, "failed": failed, "errors": errors, "call_log_id": cl.id, "message_id": message_id}
+    # schedule server-side timeout to mark missed if nobody answers in 60s
+    try:
+        schedule_call_timeout(appt.id, cl.id, timeout_seconds=60)
+    except Exception as e:
+        print("START_CALL: schedule_call_timeout failed:", e)
 
+# ---------- <<END START_CALL_PATCH>> ----------
+
+
+# ---------- <<ANSWER_CALL_PATCH>> ----------
 @app.post("/appointments/{appointment_id}/call/answer", response_model=dict)
-def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)):
+def answer_call(
+    appointment_id: int, call_log_id: Optional[int] = Form(None), current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)
+):
+    """
+    Patient answers: mark the CallLog answered and notify doctor(s) that patient joined.
+    """
     appt = db.get(Appointment, appointment_id)
     if not appt:
         raise HTTPException(404, "Appointment not found")
@@ -2478,56 +2694,62 @@ def answer_call(appointment_id: int, call_log_id: Optional[int] = Form(None), cu
         raise HTTPException(400, "call log mismatch")
 
     if not cl:
-        cl = CallLog(appointment_id=appointment_id, started_at=datetime.utcnow())
+        # fallback: create a call log if the doctor didn't create one (defensive)
+        cl = CallLog(appointment_id=appointment_id, started_at=datetime.utcnow(), started_by_user_id=None, status="answered")
+        db.add(cl)
+        db.commit()
+        db.refresh(cl)
 
+    # Mark answered
     cl.answered_at = datetime.utcnow()
     cl.status = "answered"
     db.commit()
-    return {"ok": True, "call_log_id": cl.id}
 
-@app.post("/appointments/{appointment_id}/call/end", response_model=dict)
-def end_call(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user), call_log_id: Optional[int] = Body(None)):
-    """
-    Called by patient to decline or end a call. Will mark the call log (if provided)
-    and notify the doctor(s) of this appointment to end the call.
-    """
-    appt = db.get(Appointment, appointment_id)
-    if not appt:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-
-    # Security: only the patient or admin should call this (or doctor to end)
-    if not (current_user.role == UserRole.patient and appt.patient.user_id == current_user.id) and current_user.role != UserRole.admin and not (current_user.role == UserRole.doctor and appt.doctor.user_id == current_user.id):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    # Mark call_log ended if provided
-    if call_log_id:
-        cl = db.get(CallLog, call_log_id)
-        if cl and cl.appointment_id == appointment_id:
-            cl.ended_at = datetime.utcnow()
-            cl.status = "ended"
-            db.commit()
-
-    # Notify doctor's device tokens to end call
+    # Notify doctor's device tokens that patient has joined
     try:
         tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == appt.doctor.user_id).all()
         tokens = [t.token for t in tokens_q if t and t.token]
         if tokens:
-            title = "Call ended"
-            body = f"Patient declined the call for appointment #{appt.id}"
-            data_payload = {"type": "video_end", "appointment_id": str(appt.id)}
-            # Build simple multicast message (works with older/newer firebase-admin)
+            title = f"Patient joined"
+            body = f"Patient has answered appointment #{appt.id}"
+            data_payload = {"type": "participant_joined", "appointment_id": str(appt.id), "call_log_id": str(cl.id), "message_id": f"call_{cl.id}_joined"}
             multicast = messaging.MulticastMessage(
                 notification=messaging.Notification(title=title, body=body),
                 data={k: str(v) for k, v in data_payload.items()},
-                tokens=list(set(tokens))
+                tokens=list(set(tokens)),
             )
             res = messaging.send_multicast(multicast)
-            print(f"END_CALL: notified doctor tokens success={res.success_count} failed={res.failure_count}")
+            print(f"ANSWER_CALL: notified doctor tokens success={res.success_count} failed={res.failure_count}")
     except Exception as e:
-        print("END_CALL: failed to notify doctor:", e)
+        print("ANSWER_CALL: failed to notify doctor:", e)
 
+    return {"ok": True, "call_log_id": cl.id}
+# ---------- <<END ANSWER_CALL_PATCH>> ----------
+
+
+# ---------- <<END_CALL_PATCH>> ----------
+@app.post("/appointments/{appointment_id}/call/end", response_model=dict)
+def end_call(appointment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user), call_log_id: Optional[int] = Body(None)):
+    """
+    Called by any party (patient, doctor, admin) to end a call. Marks CallLog ended and notifies BOTH
+    doctor and patient with type=video_end. Idempotent.
+    """
+    # Security check unchanged (your existing guard)
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    if not (current_user.role == UserRole.patient and appt.patient.user_id == current_user.id) and current_user.role != UserRole.admin and not (current_user.role == UserRole.doctor and appt.doctor.user_id == current_user.id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Call the internal routine (idempotent). This will mark CallLog ended and notify both sides.
+    ok = _end_call_internal(db, appointment_id, call_log_id=call_log_id, reason="ended", by=getattr(current_user, "id", None))
+    if not ok:
+        # internal helper already printed/logged; respond success for idempotency
+        return {"ok": True}
     return {"ok": True}
 
+# ---------- <<END END_CALL_PATCH>> ----------
 
 @app.post("/appointments/{appointment_id}/video/token", response_model=dict)
 def mint_video_token(
@@ -3696,6 +3918,336 @@ def add_appt_note(appointment_id: int, body: NoteIn,
     appt.last_modified_at = datetime.utcnow()
     db.add(row); db.commit()
     return {"ok": True, "id": row.id, "created_at": row.created_at}
+
+from pydantic import BaseModel
+
+class MessageIn(BaseModel):
+    body: str
+    kind: Optional[str] = "text"
+
+# List messages with simple paging
+@app.get("/appointments/{appointment_id}/messages", response_model=List[dict])
+def list_messages(appointment_id: int, page: int = 1, page_size: int = 50, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+    # Authorization: only patient/doctor/admin
+    if not ((current.role == UserRole.admin) or
+            (current.role == UserRole.doctor and appt.doctor.user_id == current.id) or
+            (current.role == UserRole.patient and appt.patient.user_id == current.id)):
+        raise HTTPException(403, "Forbidden")
+    q = db.query(Message).filter(Message.appointment_id == appointment_id).order_by(Message.created_at.asc())
+    items = q.offset((page - 1) * page_size).limit(page_size).all()
+    out = []
+    for m in items:
+        out.append({
+            "id": m.id,
+            "appointment_id": m.appointment_id,
+            "sender_user_id": m.sender_user_id,
+            "recipient_user_id": m.recipient_user_id,
+            "body": m.body,
+            "kind": m.kind,
+            "read": m.read,
+            "created_at": m.created_at,
+        })
+    return out
+
+@app.post("/appointments/{appointment_id}/messages", response_model=dict)
+def post_message(appointment_id: int, payload: MessageIn, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+    # Authorization: only patient/doctor/admin
+    if not ((current.role == UserRole.admin) or
+            (current.role == UserRole.doctor and appt.doctor.user_id == current.id) or
+            (current.role == UserRole.patient and appt.patient.user_id == current.id)):
+        raise HTTPException(403, "Forbidden")
+
+    # Compute recipient
+    recipient_id = None
+    if current.role == UserRole.doctor:
+        recipient_id = appt.patient.user_id
+    elif current.role == UserRole.patient:
+        recipient_id = appt.doctor.user_id
+
+    msg = Message(
+        appointment_id=appointment_id,
+        sender_user_id=current.id,
+        recipient_user_id=recipient_id,
+        body=payload.body,
+        kind=payload.kind or "text",
+        created_at=datetime.utcnow(),
+        read=False,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    # Notify other party via FCM (data-only message)
+    try:
+        _notify_chat_message(db, appt, msg)
+    except Exception as e:
+        print('Failed to notify chat recipient:', e)
+
+    return {"ok": True, "message_id": msg.id, "created_at": msg.created_at}
+
+@app.post("/appointments/{appointment_id}/messages/mark_read", response_model=dict)
+def mark_messages_read(appointment_id: int, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+    # authorization same as above...
+    q = db.query(Message).filter(Message.appointment_id == appointment_id, Message.recipient_user_id == current.id, Message.read == False)
+    updated = q.update({"read": True}, synchronize_session=False)
+    db.commit()
+    return {"ok": True, "updated": int(updated)}
+
+# ---------- Chat model + endpoints (patient <-> doctor chat) ----------
+from sqlalchemy import inspect
+from sqlalchemy.exc import OperationalError
+
+class AppointmentMessage(Base):
+    __tablename__ = "appointment_messages"
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False, index=True)
+    sender_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    body = Column(Text, default="")
+    file_path = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # relationships (optional)
+    appointment = relationship("Appointment")
+    sender = relationship("User")
+
+# Add sqlite schema auto-create for appointment_messages
+def _ensure_messages_table(conn):
+    rows = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='appointment_messages'")).all()
+    if not rows:
+        conn.execute(text("""
+            CREATE TABLE appointment_messages (
+                id INTEGER PRIMARY KEY,
+                appointment_id INTEGER NOT NULL,
+                sender_user_id INTEGER NOT NULL,
+                body TEXT DEFAULT '',
+                file_path TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """))
+
+# Extend ensure_sqlite_schema to create table if missing
+def ensure_sqlite_schema_extended(engine):
+    # call original ensure_sqlite_schema first
+    ensure_sqlite_schema(engine)
+    if engine.url.get_backend_name() != "sqlite":
+        return
+    with engine.begin() as conn:
+        try:
+            _ensure_messages_table(conn)
+        except Exception:
+            pass
+
+# If you call ensure_sqlite_schema elsewhere during startup, also call the extended one instead.
+# But to be safe, call it on startup (after ensure_sqlite_schema(engine)): 
+# (In your existing on_startup you already call ensure_sqlite_schema(engine) — update to ensure_sqlite_schema_extended)
+# For minimal change, below we simply call _ensure_messages_table here (idempotent)
+try:
+    if engine.url.get_backend_name() == "sqlite":
+        with engine.begin() as conn:
+            _ensure_messages_table(conn)
+except Exception:
+    pass
+
+# Helper: broadcast chat message to the other participant's tokens
+def _notify_chat_message(db: Session, appt: Appointment, msg: AppointmentMessage):
+    """
+    Notify the other participant (patient or doctor) about a new chat message.
+    Sends a data-only message with type=chat_message.
+    """
+    try:
+        # Determine recipient user ids: both doctor.user_id and patient.user_id
+        recipients = []
+        try:
+            if appt.doctor and appt.doctor.user_id:
+                recipients.append(appt.doctor.user_id)
+        except Exception:
+            pass
+        try:
+            if appt.patient and appt.patient.user_id:
+                recipients.append(appt.patient.user_id)
+        except Exception:
+            pass
+
+        # exclude sender
+        recipients = [u for u in set(recipients) if u != msg.sender_user_id]
+        if not recipients:
+            return
+
+        # fetch tokens
+        tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id.in_(recipients)).all()
+        tokens = [t.token for t in tokens_q if t and t.token]
+        if not tokens:
+            return
+
+        payload = {
+            "type": "chat_message",
+            "appointment_id": str(msg.appointment_id),
+            "message_id": str(msg.id),
+            "sender_id": str(msg.sender_user_id),
+            "body": (msg.body or "")[:200],  # short preview
+        }
+
+        try:
+            # prefer multicast if available
+            fcm_send_data_tokens(db, tokens, payload, ttl_seconds=60)
+        except Exception as e:
+            # best effort
+            print("_notify_chat_message fcm error:", e)
+    except Exception as e:
+        print("_notify_chat_message internal error:", e)
+
+
+# Endpoint: List chat messages for an appointment
+@app.get("/appointments/{appointment_id}/chat", response_model=dict)
+def list_chat_messages(
+    appointment_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    current: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    # permission: admin or doctor/patient on appt
+    allowed = (
+        current.role == UserRole.admin
+        or (current.role == UserRole.doctor and appt.doctor and appt.doctor.user_id == current.id)
+        or (current.role == UserRole.patient and appt.patient and appt.patient.user_id == current.id)
+    )
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+
+    base = db.query(AppointmentMessage).filter(AppointmentMessage.appointment_id == appointment_id)
+    total = base.count()
+    items = base.order_by(AppointmentMessage.created_at.asc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    out = []
+    for m in items:
+        out.append({
+            "id": m.id,
+            "appointment_id": m.appointment_id,
+            "sender_user_id": m.sender_user_id,
+            "body": m.body,
+            "file_path": m.file_path,
+            "created_at": m.created_at,
+        })
+    return {"ok": True, "page": page, "page_size": page_size, "total": total, "items": out}
+
+
+# Endpoint: Send chat message (text + optional file)
+@app.post("/appointments/{appointment_id}/chat/send", response_model=dict)
+async def send_chat_message(
+    appointment_id: int,
+    request: Request,
+    file: UploadFile = File(None),
+    body: Optional[str] = Form(None),
+    current: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Send a chat message in the appointment thread.
+    Accepts either:
+      - JSON body { "body": "..." } (Content-Type: application/json)
+      - multipart/form-data with 'body' and optional 'file'
+    """
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    # permission: only doctor/patient/admin (doctor/patient must belong to appt)
+    allowed = (
+        current.role == UserRole.admin
+        or (current.role == UserRole.doctor and appt.doctor and appt.doctor.user_id == current.id)
+        or (current.role == UserRole.patient and appt.patient and appt.patient.user_id == current.id)
+    )
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+
+    # Parse JSON body if any
+    text_body = None
+    try:
+        raw = await request.body()
+        if raw:
+            import json
+            try:
+                j = json.loads(raw)
+                if isinstance(j, dict):
+                    text_body = j.get("body", text_body)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Prefer form/body param
+    if body is not None:
+        text_body = body
+
+    # For multipart file, save file
+    file_path = None
+    if file is not None:
+        try:
+            fname = f"chat_{appointment_id}_{current.id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{file.filename}"
+            path = os.path.join("uploads", fname)
+            with open(path, "wb") as fh:
+                fh.write(file.file.read())
+            file_path = path
+        except Exception as e:
+            print("chat upload error:", e)
+            raise HTTPException(500, "Failed to save uploaded file")
+
+    if (not text_body or not str(text_body).strip()) and not file_path:
+        raise HTTPException(422, "body or file is required")
+
+    msg = AppointmentMessage(
+        appointment_id=appointment_id,
+        sender_user_id=current.id,
+        body=(text_body or "").strip(),
+        file_path=file_path,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    # Notify the other participant(s)
+    try:
+        _notify_chat_message(db, appt, msg)
+    except Exception as e:
+        print("notify_chat_message error:", e)
+
+    return {
+        "ok": True,
+        "message": {
+            "id": msg.id,
+            "appointment_id": msg.appointment_id,
+            "sender_user_id": msg.sender_user_id,
+            "body": msg.body,
+            "file_path": msg.file_path,
+            "created_at": msg.created_at,
+        },
+    }
+
+# Endpoint: upload-only helper (multipart-only)
+@app.post("/appointments/{appointment_id}/chat/upload", response_model=dict)
+async def upload_chat_file_only(
+    appointment_id: int,
+    file: UploadFile = File(...),
+    note: Optional[str] = Form(None),
+    current: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # reuse send endpoint logic
+    return await send_chat_message(appointment_id, Request(scope=None), file=file, body=(note or ""), current=current, db=db)
 
 # -----------------------------------------------------------------------------
 # Bootstrap admin

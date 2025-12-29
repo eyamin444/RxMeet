@@ -1,16 +1,4 @@
-// lib/screens/doctor/dashboard.dart
-//
-// Doctor dashboard (tabs: Appointments, Patients, Schedule, Profile)
-//
-// ✅ Appointments tab with filters & sorting
-// ✅ Schedule tab: list weekly/date rules with ON/OFF, inline edit, delete,
-//    sorting options, and created-at shown via tooltip (no inline text for weekly)
-// ✅ Daily create form has its own maxPatients/mode (sent as `mode` to API)
-// ✅ Patients and Profile tabs
-// ✅ Appointment detail: progress + TEXT PRESCRIPTION composer with preview
-//    (pad-style), per-appointment list (text/file) with open/zoom + delete,
-//    edit allowed until 24h after completed. File delete fixed.
-// ✅ Photo upload fixed for web/mobile with clear UX
+
 
 // lib/screens/doctor/dashboard.dart
 // Doctor dashboard (tabs: Appointments, Patients, Schedule, Profile)
@@ -40,6 +28,7 @@ import '../../main.dart' show LoginPage;
 import '../../models.dart';
 import '../../services/api.dart';
 import 'package:smart_gateway_app/screens/video/video_screen.dart';
+import '../../screens/chat/chat_screen.dart';
 
 import '../../services/auth.dart';
 import 'package:flutter/rendering.dart' show RenderRepaintBoundary;
@@ -3524,16 +3513,15 @@ doc.addPage(
                         icon: const Icon(Icons.video_call_outlined),
                         label: const Text('Join video'),
                       ),
-                      OutlinedButton.icon(
-                        onPressed: () => Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) =>
-                                _ChatStubPage(apptId: widget.apptId),
+                        OutlinedButton.icon(
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => ChatScreen(apptId: widget.apptId),
+                            ),
                           ),
+                          icon: const Icon(Icons.chat_bubble_outline),
+                          label: const Text('Chat'),
                         ),
-                        icon: const Icon(Icons.chat_bubble_outline),
-                        label: const Text('Chat'),
-                      ),
                     ],
                   ),
                 ],
@@ -3858,11 +3846,18 @@ class _ChatStubPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Immediately navigate to ChatScreen so the button behaviour
+    // matches user expectation: the Chat button opens the real chat.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => ChatScreen(apptId: apptId)),
+      );
+    });
+
+    // While pushing replacement, show a short loading UI
     return Scaffold(
       appBar: AppBar(title: Text('Chat — #$apptId')),
-      body: const Center(
-        child: Text('Chat coming soon…'),
-      ),
+      body: const Center(child: CircularProgressIndicator()),
     );
   }
 }

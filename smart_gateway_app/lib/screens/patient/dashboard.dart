@@ -40,6 +40,7 @@ import '../../services/api.dart';
 import '../../services/auth.dart';
 import '../../widgets/snack.dart';
 import '../../screens/video/video_screen.dart';
+import '../../screens/chat/chat_screen.dart';
 import '../../widgets/notification_bell.dart';
 import '../../services/notification_sync.dart';
 import '../payment/payment_screen.dart';
@@ -2878,8 +2879,9 @@ try {
   }
 
   //bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _videoWindowNow();
+  //bool get _canChat  => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _paid && _status == 'approved';
   bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold');
-  bool get _canChat  => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _paid && _status == 'approved';
+  bool get _canChat  => _isOnline && (_progress == 'in_progress' || _progress == 'hold');
 
   // ---------------- actions ----------------
   Future<bool> _confirm({
@@ -3423,41 +3425,41 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                           ),
                         ),
                       ],
-// Online-only live actions
-_isOnline
-    ? Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: [
-          FilledButton.icon(
-            onPressed: _canVideo
-                ? () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            VideoScreen(
-                          appointmentId: widget.apptId,
-                          isDoctor: false,
-                        )
-                      ),
-                    )
-                : null,
-            icon: const Icon(Icons.videocam),
-            label: const Text('Video'),
-          ),
-          FilledButton.tonalIcon(
-            onPressed: _canChat
-                ? () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => _ChatPage(apptId: widget.apptId),
-                      ),
-                    )
-                : null,
-            icon: const Icon(Icons.chat_bubble_outline),
-            label: const Text('Chat'),
-          ),
-        ],
-      )
-    : const SizedBox.shrink(),
+                // Online-only live actions
+                _isOnline
+                    ? Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          FilledButton.icon(
+                            onPressed: _canVideo
+                                ? () => Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) =>
+                                            VideoScreen(
+                                          appointmentId: widget.apptId,
+                                          isDoctor: false,
+                                        )
+                                      ),
+                                    )
+                                : null,
+                            icon: const Icon(Icons.videocam),
+                            label: const Text('Video'),
+                          ),
+                          FilledButton.tonalIcon(
+                            onPressed: _canChat
+                                ? () => Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => ChatScreen(apptId: widget.apptId),
+                                      ),
+                                    )
+                                : null,
+                            icon: const Icon(Icons.chat_bubble_outline),
+                            label: const Text('Chat'),
+                          ),
+                        ],
+                      )
+                    : const SizedBox.shrink(),
 
                     ],
                   );
@@ -6106,77 +6108,24 @@ class _ProfileTab extends StatefulWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 // Simple placeholder chat page for online appointments
 // ─────────────────────────────────────────────────────────────────────────────
-class _ChatPage extends StatefulWidget {
-  const _ChatPage({required this.apptId});
+class _ChatStubPage extends StatelessWidget {
+  const _ChatStubPage({required this.apptId});
   final int apptId;
 
   @override
-  State<_ChatPage> createState() => _ChatPageState();
-}
-
-class _ChatPageState extends State<_ChatPage> {
-  final _text = TextEditingController();
-  final List<String> _msgs = [];
-
-  @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text('Chat • appt #${widget.apptId}')),
-      body: Column(
-        children: [
-          Expanded(
-            child: _msgs.isEmpty
-                ? const Center(child: Text('No messages yet'))
-                : ListView.builder(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _msgs.length,
-                    itemBuilder: (_, i) => Align(
-                      alignment: i.isEven ? Alignment.centerLeft : Alignment.centerRight,
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Text(_msgs[i]),
-                      ),
-                    ),
-                  ),
-          ),
-          const Divider(height: 1),
-          Padding(
-            padding: const EdgeInsets.all(8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _text,
-                    decoration: const InputDecoration(
-                      hintText: 'Type a message…',
-                      border: OutlineInputBorder(),
-                    ),
-                    onSubmitted: (_) => _send(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton.icon(
-                  onPressed: _send,
-                  icon: const Icon(Icons.send),
-                  label: const Text('Send'),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+    // Immediately navigate to ChatScreen so the button behaviour
+    // matches user expectation: the Chat button opens the real chat.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => ChatScreen(apptId: apptId),),
+      );
+    });
 
-  void _send() {
-    final t = _text.text.trim();
-    if (t.isEmpty) return;
-    setState(() => _msgs.add(t));
-    _text.clear();
+    // While pushing replacement, show a short loading UI
+    return Scaffold(
+      appBar: AppBar(title: Text('Chat — #$apptId')),
+      body: const Center(child: CircularProgressIndicator()),
+    );
   }
 }

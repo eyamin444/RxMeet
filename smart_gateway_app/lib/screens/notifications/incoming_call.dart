@@ -1,10 +1,13 @@
 // lib/screens/notifications/incoming_call.dart
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../Services/Api.dart';
 import '../../widgets/snack.dart';
 import '../../services/ringtone.dart';
 import '../video/video_screen.dart';
+import '../../services/notification_center.dart';
 
 class IncomingCallPage extends StatefulWidget {
   final int appointmentId;
@@ -26,6 +29,9 @@ class IncomingCallPage extends StatefulWidget {
 
 class _IncomingCallPageState extends State<IncomingCallPage> {
   bool _joining = false;
+  StreamSubscription<LocalNotice>? _noticeSub;
+  bool _closedByRemote = false; // to avoid double-close race
+  bool _ringPlaying = false;
 
   @override
   void initState() {
@@ -38,16 +44,58 @@ class _IncomingCallPageState extends State<IncomingCallPage> {
         await RingtoneService.init();
         await RingtoneService.unlockAudioOnce();
         await RingtoneService.playLooping();
+        _ringPlaying = true;
       } catch (e) {
         debugPrint('IncomingCallPage: ringtone init/play failed: $e');
       }
+    }();
+
+    // Subscribe to NotificationCenter push stream so we can close if call ended remotely
+    _noticeSub = NotificationCenter().pushStream.listen((LocalNotice notice) {
+      try {
+        if (notice.type == 'video_end' || notice.type == 'call_end' || notice.type == 'missed_call') {
+          if (notice.appointmentId == widget.appointmentId) {
+            // If callLogId present, match it (preferred). Otherwise, match appointment.
+            if (widget.callLogId != null) {
+              if (notice.callLogId != null && notice.callLogId == widget.callLogId) {
+                _closeBecauseRemote();
+              } else {
+                // If notice has no callLogId, still assume appointment-level end should close
+                _closeBecauseRemote();
+              }
+            } else {
+              // No callLogId on the incoming page; close for appointment-level end.
+              _closeBecauseRemote();
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('IncomingCallPage _noticeSub error: $e');
+      }
+    });
+  }
+
+  void _closeBecauseRemote() {
+    if (_closedByRemote) return;
+    _closedByRemote = true;
+    // Stop ringtone, pop UI
+    () async {
+      try {
+        await RingtoneService.stop();
+      } catch (_) {}
+      if (mounted) Navigator.of(context).pop();
     }();
   }
 
   Future<void> _acceptCall() async {
     setState(() => _joining = true);
     try {
-      await RingtoneService.stop();
+      try {
+        if (_ringPlaying) {
+          await RingtoneService.stop();
+          _ringPlaying = false;
+        }
+      } catch (_) {}
 
       // Ensure Api init
       try {
@@ -94,10 +142,13 @@ class _IncomingCallPageState extends State<IncomingCallPage> {
   Future<void> _declineCall() async {
     // stop ringtone
     try {
-      await RingtoneService.stop();
+      if (_ringPlaying) {
+        await RingtoneService.stop();
+        _ringPlaying = false;
+      }
     } catch (_) {}
 
-    // notify server
+    // notify server (ensure we only call once)
     try {
       if (!Api.isReady) await Api.init();
       await Api.post('/appointments/${widget.appointmentId}/call/end',
@@ -114,8 +165,11 @@ class _IncomingCallPageState extends State<IncomingCallPage> {
 
   @override
   void dispose() {
+    _noticeSub?.cancel();
     // ensure ringtone is stopped
-    RingtoneService.stop();
+    try {
+      RingtoneService.stop();
+    } catch (_) {}
     super.dispose();
   }
 
