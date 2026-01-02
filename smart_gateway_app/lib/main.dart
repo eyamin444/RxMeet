@@ -171,16 +171,45 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 // <<INIT_NOTIFICATIONS>>
 Future<void> initNotifications() async {
   const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
-  // iOS initialization options can be added if needed.
-  await notifications.initialize(const InitializationSettings(android: androidInit));
 
-  // Timezone (kept to Asia/Dhaka as earlier)
+  // Initialize with a tap handler so local notification taps open correct UI
+  await notifications.initialize(
+    const InitializationSettings(android: androidInit),
+    onDidReceiveNotificationResponse: (NotificationResponse response) async {
+      try {
+        if (response.payload == null || response.payload!.isEmpty) return;
+        final Map<String, dynamic> data = jsonDecode(response.payload!);
+        final type = (data['type'] ?? '').toString();
+        if (type == 'chat_message') {
+          final apptId = int.tryParse(data['appointment_id']?.toString() ?? '') ?? 0;
+          if (apptId > 0) {
+            navigatorKey.currentState?.push(MaterialPageRoute(
+              builder: (_) => ChatScreen(apptId: apptId),
+            ));
+          }
+        } else if (type == 'doctor_call') {
+          final apptId = int.tryParse(data['appointment_id']?.toString() ?? '') ?? 0;
+          navigatorKey.currentState?.push(MaterialPageRoute(
+            builder: (_) => IncomingCallPage(
+              appointmentId: apptId,
+              room: data['room'] ?? '',
+              doctorName: data['doctor_name'] ?? 'Doctor',
+              callLogId: data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null,
+            ),
+          ));
+        }
+      } catch (e) {
+        print('onDidReceiveNotificationResponse error: $e');
+      }
+    },
+  );
+
+  // Timezone (keep as you had)
   tzdata.initializeTimeZones();
   tz.setLocalLocation(tz.getLocation('Asia/Dhaka'));
 
-  // Request permission for notifications on Android 13+ (and create channels)
-  final androidImpl =
-      notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  // Request permission / create channels (Android 13+)
+  final androidImpl = notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
   await androidImpl?.requestNotificationsPermission();
 
   if (androidImpl != null) {
@@ -192,7 +221,6 @@ Future<void> initNotifications() async {
         importance: Importance.defaultImportance,
       ));
 
-      // Calls channel with custom native sound
       final callsChannel = AndroidNotificationChannel(
         'calls_channel',
         'Incoming Calls',
@@ -202,6 +230,16 @@ Future<void> initNotifications() async {
         playSound: true,
       );
       await androidImpl.createNotificationChannel(callsChannel);
+
+      // chat channel with high importance
+      final chatChannel = AndroidNotificationChannel(
+        'chat_channel',
+        'Chat Messages',
+        description: 'Chat message notifications',
+        importance: Importance.high,
+      );
+      await androidImpl.createNotificationChannel(chatChannel);
+
     } catch (e) {
       print('createNotificationChannel error: $e');
     }
@@ -432,13 +470,8 @@ class _BootstrapState extends State<_Bootstrap> {
       // When user taps notification and app opens from background
       FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) async {
         try {
-          // Dedupe before responding to user tap
-          if (!await _shouldProcessMessage(message)) {
-            return;
-          }
-
+          if (!await _shouldProcessMessage(message)) return;
           final data = message.data;
-          print('FCM onMessageOpenedApp: ${data}');
           final type = (data['type'] ?? '').toString();
           if (type == 'doctor_call' || type == 'video_ready') {
             final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
@@ -450,6 +483,13 @@ class _BootstrapState extends State<_Bootstrap> {
                 callLogId: data.containsKey('call_log_id') ? int.tryParse(data['call_log_id'] ?? '') : null,
               ),
             ));
+          } else if (type == 'chat_message') {
+            final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
+            if (apptId > 0) {
+              navigatorKey.currentState?.push(MaterialPageRoute(
+                builder: (_) => ChatScreen(apptId: apptId),
+              ));
+            }
           } else {
             await _showLocalNotification(message, isCall: false);
           }
@@ -458,13 +498,14 @@ class _BootstrapState extends State<_Bootstrap> {
         }
       });
 
+
       // App launched from terminated state via a notification
       try {
         final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
         if (initialMessage != null) {
-          // Dedupe/guard initialMessage too
           if (await _shouldProcessMessage(initialMessage)) {
-            if ((initialMessage.data['type'] ?? '') == 'doctor_call') {
+            final type = (initialMessage.data['type'] ?? '').toString();
+            if (type == 'doctor_call') {
               final data = initialMessage.data;
               final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
               WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -477,8 +518,17 @@ class _BootstrapState extends State<_Bootstrap> {
                   ),
                 ));
               });
+            } else if (type == 'chat_message') {
+              final data = initialMessage.data;
+              final apptId = int.tryParse(data['appointment_id'] ?? '') ?? 0;
+              if (apptId > 0) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  navigatorKey.currentState?.push(MaterialPageRoute(
+                    builder: (_) => ChatScreen(apptId: apptId),
+                  ));
+                });
+              }
             } else {
-              // Not a call; optionally show a notification
               await _showLocalNotification(initialMessage, isCall: false);
             }
           }
@@ -486,6 +536,7 @@ class _BootstrapState extends State<_Bootstrap> {
       } catch (e) {
         print('Error handling initialMessage: $e');
       }
+
     } // end if patient
 
     if (mounted) setState(() => loading = false);

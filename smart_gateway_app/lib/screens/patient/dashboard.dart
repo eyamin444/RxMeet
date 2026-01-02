@@ -5382,7 +5382,7 @@ class _PaymentsTabState extends State<_PaymentsTab> {
             controller: txnController,
             decoration: const InputDecoration(
               prefixIcon: Icon(Icons.badge_outlined),
-              labelText: 'Transaction ID',
+              labelText: ' ID',
               border: UnderlineInputBorder(),
             ),
             onSubmitted: (_) { page = 1; _load(); },

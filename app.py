@@ -1,5 +1,9 @@
 # app.py
+from pathlib import Path
+from dotenv import load_dotenv
 
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 from datetime import datetime, timedelta, date as dt_date, date
 from enum import Enum
 import os, secrets
@@ -25,6 +29,9 @@ from sqlalchemy.orm import Session
 from firebase_admin import messaging
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 from io import BytesIO
+from sqlalchemy import func
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -258,11 +265,18 @@ class Appointment(Base):
     last_modified_by_user_id = Column(Integer, nullable=True)
     last_modified_at = Column(DateTime, nullable=True)
 
+    # New columns
+    serial_number = Column(Integer, nullable=True)
+    estimated_visit_time = Column(DateTime, nullable=True)
+
     patient = relationship("Patient", back_populates="appointments")
     doctor = relationship("Doctor", back_populates="appointments")
     prescription = relationship("Prescription", back_populates="appointment", uselist=False)
     rating = relationship("DoctorRating", back_populates="appointment", uselist=False)
-    payment = relationship("Payment", back_populates="appointment", uselist=False)
+
+    # Payments: one-to-many
+    payments = relationship("Payment", back_populates="appointment", cascade="all, delete-orphan")
+
     changes = relationship("AppointmentChangeLog", back_populates="appointment", cascade="all, delete-orphan")
     notes_thread = relationship("AppointmentNote", back_populates="appointment", cascade="all, delete-orphan")
 
@@ -349,14 +363,14 @@ class DoctorRating(Base):
 class Payment(Base):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True)
-    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False, unique=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)  # allow many payments
     transaction_id = Column(String, nullable=False)
     method = Column(String, nullable=False)
     amount = Column(Float, nullable=True)
     status = Column(SAEnum(PaymentStatus), default=PaymentStatus.paid)
     paid_at = Column(DateTime, default=datetime.utcnow)
     raw = Column(Text, default="")
-    appointment = relationship("Appointment", back_populates="payment")
+    appointment = relationship("Appointment", back_populates="payments")
 
 class DeviceToken(Base):
     __tablename__ = "device_tokens"
@@ -437,8 +451,11 @@ def ensure_sqlite_schema(engine):
             ("last_modified_by_user_id", "last_modified_by_user_id INTEGER"),
             ("last_modified_at", "last_modified_at TEXT"),
             ("completed_at", "completed_at TEXT"),
+            ("serial_number", "serial_number INTEGER"),
+            ("estimated_visit_time", "estimated_visit_time TEXT"),
         ]:
             if not _has_column(conn, "appointments", col): _add_column(conn, "appointments", ddl)
+
         # availabilities
         if not _has_column(conn, "availabilities", "max_patients"):
             _add_column(conn, "availabilities", "max_patients INTEGER DEFAULT 4")
@@ -918,11 +935,20 @@ class AppointmentOut(BaseModel):
     completed_at: Optional[datetime] = None
     doctor_name: Optional[str] = None
     patient_name: Optional[str] = None
+    serial_number: Optional[int] = None
+    estimated_visit_time: Optional[datetime] = None
     class Config: from_attributes = True
 
 
 class ApproveIn(BaseModel):
     approve: bool
+    # optional payment verification fields (admin can pass these while approving)
+    transaction_id: Optional[str] = None
+    method: Optional[str] = None
+    amount: Optional[float] = None
+    # optional reason for rejection (admin can provide a note when rejecting)
+    reason: Optional[str] = None
+
 
 class AvailabilityIn(BaseModel):
     day_of_week: int
@@ -1262,16 +1288,411 @@ def admin_list_appointments(status_filter: Optional[AppointmentStatus] = None,
     if status_filter: q = q.filter(Appointment.status == status_filter)
     return q.order_by(Appointment.start_time.desc()).all()
 
-@app.patch("/admin/appointments/{appointment_id}/approve", response_model=AppointmentOut)
+
+from datetime import datetime, timedelta
+
+from sqlalchemy import or_, func, text  # ensure func/or_ already imported near top
+
+
+@app.patch("/admin/appointments/{appointment_id}/approve", response_model=dict)
 def approve_appointment(appointment_id: int, body: ApproveIn, db: Session = Depends(get_db),
                         curr: User = Depends(require_role(UserRole.admin))):
+    """
+    Approve or reject an appointment.
+
+    Important: serial_number is assigned per *schedule window* (DateRule or Availability).
+    - Find the best matching DateRule (exact date) or weekly Availability (weekday) whose
+      window covers the appointment start_time.
+    - Compute serial by counting existing appointments for the same doctor within that
+      exact window (schedule_start .. schedule_end) and taking max(serial) + 1 (or 1 if none).
+    - Compute estimated_visit_time = schedule_start + (serial - 1) * slot_minutes
+      where slot_minutes = max(1, floor(window_minutes / max_patients)).
+    """
     appt = db.get(Appointment, appointment_id)
-    if not appt: raise HTTPException(404, "Appointment not found")
-    appt.status = AppointmentStatus.approved if body.approve else AppointmentStatus.rejected
-    appt.last_modified_by_user_id = curr.id
-    appt.last_modified_at = datetime.utcnow()
-    db.commit(); db.refresh(appt)
-    return appt
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # guard: if appointment already finalized, don't allow re-approve
+    status_now = (appt.status.value if appt.status else "").lower()
+    # Allow re-approve only if you want; here we continue with normal flow.
+
+    created_payment = False
+
+    if body.approve:
+        # ---- handle optional payment creation first ----
+        method = (body.method or "").strip() if hasattr(body, "method") else ""
+        tx = (body.transaction_id or "").strip() if hasattr(body, "transaction_id") else ""
+        amt = getattr(body, "amount", None) if hasattr(body, "amount") else None
+
+        # If any payment info supplied, require method and handle cash specially
+        if method:
+            if method.lower() != "cash" and not tx:
+                raise HTTPException(status_code=422, detail="transaction_id is required for non-cash payments")
+
+            # If cash and tx empty, auto-generate one
+            if method.lower() == "cash" and not tx:
+                tx = f"CASH-{secrets.token_urlsafe(8)}"
+
+            # Create payment record (mark as paid)
+            try:
+                pay = Payment(
+                    appointment_id=appt.id,
+                    transaction_id=tx,
+                    method=method,
+                    amount=amt,
+                    status=PaymentStatus.paid,
+                    paid_at=datetime.utcnow(),
+                    raw="(entered-by-admin)"
+                )
+                db.add(pay)
+                db.flush()
+                created_payment = True
+            except Exception as e:
+                db.rollback()
+                raise HTTPException(status_code=500, detail=f"Failed to record payment: {e}")
+
+        # ---- compute serial_number and estimated_visit_time per schedule window ----
+        # Only compute serial if appointment has a start_time (otherwise fallback to day-based)
+        if appt.start_time:
+            appt_date = appt.start_time.date()
+            schedule_row = None
+            schedule_start_dt = None
+            schedule_end_dt = None
+            schedule_max_patients = None
+
+            # 1) Prefer DateRule for that exact date that contains the appointment time
+            try:
+                drs = (db.query(DateRule)
+                         .filter(DateRule.doctor_id == appt.doctor_id,
+                                 DateRule.target_date == appt_date,
+                                 DateRule.active == True)
+                         .all())
+            except Exception:
+                drs = []
+
+            if drs:
+                # find a rule whose time window covers appointment.start_time
+                for r in drs:
+                    # some DateRule may store start_hour/end_hour; adapt to your schema
+                    start_hour = int(getattr(r, "start_hour", 0))
+                    start_minute = int(getattr(r, "start_minute", 0) or 0)
+                    end_hour = int(getattr(r, "end_hour", start_hour + 1))
+                    end_minute = int(getattr(r, "end_minute", 0) or 0)
+
+                    candidate_start = datetime(appt_date.year, appt_date.month, appt_date.day, start_hour, start_minute)
+                    candidate_end = datetime(appt_date.year, appt_date.month, appt_date.day, end_hour, end_minute)
+                    if candidate_start <= appt.start_time < candidate_end:
+                        schedule_row = r
+                        schedule_start_dt = candidate_start
+                        schedule_end_dt = candidate_end
+                        schedule_max_patients = getattr(r, "max_patients", None)
+                        break
+                if not schedule_row:
+                    # fallback to first date rule for that date
+                    r = drs[0]
+                    start_hour = int(getattr(r, "start_hour", 9))
+                    start_minute = int(getattr(r, "start_minute", 0) or 0)
+                    end_hour = int(getattr(r, "end_hour", start_hour + 1))
+                    end_minute = int(getattr(r, "end_minute", 0) or 0)
+                    schedule_row = r
+                    schedule_start_dt = datetime(appt_date.year, appt_date.month, appt_date.day, start_hour, start_minute)
+                    schedule_end_dt = datetime(appt_date.year, appt_date.month, appt_date.day, end_hour, end_minute)
+                    schedule_max_patients = getattr(r, "max_patients", None)
+
+            # 2) If no DateRule matched, fallback to weekly Availability for the weekday
+            if not schedule_row:
+                try:
+                    # Determine weekday index as you store it (this example tries Sun=0..Sat=6 if Availability uses that)
+                    # If Availability.day_of_week uses Mon=0..Sun=6 adjust accordingly
+                    weekday_mon0 = appt.start_time.weekday()  # Mon=0..Sun=6
+                    # Try both conventions: if stored as 0=Sun adjust mapping; adapt to your model.
+                    # We'll query both possibilities: day_of_week == weekday_mon0 and day_of_week == (weekday_mon0 + 1)%7
+                    dow_candidates = [weekday_mon0, (weekday_mon0 + 1) % 7]
+                    avs = (db.query(Availability)
+                             .filter(Availability.doctor_id == appt.doctor_id,
+                                     Availability.active == True,
+                                     Availability.day_of_week.in_(dow_candidates))
+                             .all())
+                except Exception:
+                    avs = []
+
+                if avs:
+                    # pick availability that covers appointment start_time
+                    for a in avs:
+                        start_hour = int(getattr(a, "start_hour", 9))
+                        start_minute = int(getattr(a, "start_minute", 0) or 0)
+                        end_hour = int(getattr(a, "end_hour", start_hour + 1))
+                        end_minute = int(getattr(a, "end_minute", 0) or 0)
+                        # build schedule_start for the appointment date (use the appointment date, not rule date)
+                        candidate_start = datetime(appt_date.year, appt_date.month, appt_date.day, start_hour, start_minute)
+                        candidate_end = datetime(appt_date.year, appt_date.month, appt_date.day, end_hour, end_minute)
+                        if candidate_start <= appt.start_time < candidate_end:
+                            schedule_row = a
+                            schedule_start_dt = candidate_start
+                            schedule_end_dt = candidate_end
+                            schedule_max_patients = getattr(a, "max_patients", None)
+                            break
+                    if not schedule_row:
+                        a = avs[0]
+                        start_hour = int(getattr(a, "start_hour", 9))
+                        start_minute = int(getattr(a, "start_minute", 0) or 0)
+                        end_hour = int(getattr(a, "end_hour", start_hour + 1))
+                        end_minute = int(getattr(a, "end_minute", 0) or 0)
+                        schedule_row = a
+                        schedule_start_dt = datetime(appt_date.year, appt_date.month, appt_date.day, start_hour, start_minute)
+                        schedule_end_dt = datetime(appt_date.year, appt_date.month, appt_date.day, end_hour, end_minute)
+                        schedule_max_patients = getattr(a, "max_patients", None)
+
+            # 3) If still not found, fallback to the appointment's own start_time and end_time as a window
+            if not schedule_row:
+                if appt.end_time:
+                    schedule_start_dt = appt.start_time
+                    schedule_end_dt = appt.end_time
+                else:
+                    # default to one-hour window from start
+                    schedule_start_dt = appt.start_time
+                    schedule_end_dt = appt.start_time + timedelta(hours=1)
+                schedule_max_patients = getattr(appt, "max_patients", None) or 1
+
+            # Now compute slot_minutes
+            try:
+                window_minutes = max(1, int((schedule_end_dt - schedule_start_dt).total_seconds() // 60))
+            except Exception:
+                window_minutes = 60
+            try:
+                max_patients = int(schedule_max_patients or 1)
+            except Exception:
+                max_patients = 1
+            if max_patients <= 0:
+                max_patients = 1
+            slot_minutes = max(1, window_minutes // max_patients)
+
+            # Compute max serial inside this schedule window
+            try:
+                # Count appointments for same doctor whose start_time falls inside the schedule window
+                # We use appointments that already have a serial assigned in that window.
+                max_serial = db.query(func.max(Appointment.serial_number)).filter(
+                    Appointment.doctor_id == appt.doctor_id,
+                    Appointment.start_time >= schedule_start_dt,
+                    Appointment.start_time < schedule_end_dt
+                ).scalar()
+            except Exception:
+                max_serial = None
+
+            max_serial = int(max_serial or 0)
+            appt.serial_number = max_serial + 1
+
+            # Compute estimated_visit_time from schedule_start_dt
+            try:
+                offset_min = (appt.serial_number - 1) * slot_minutes
+                appt.estimated_visit_time = schedule_start_dt + timedelta(minutes=offset_min)
+            except Exception:
+                appt.estimated_visit_time = appt.start_time
+        else:
+            # No start_time, fallback: increment day-wide serial as before
+            try:
+                date_only = datetime.utcnow().date()
+                day_start = datetime(date_only.year, date_only.month, date_only.day)
+                day_end = day_start + timedelta(days=1)
+                max_serial = db.query(func.max(Appointment.serial_number)).filter(
+                    Appointment.doctor_id == appt.doctor_id,
+                    Appointment.start_time >= day_start,
+                    Appointment.start_time < day_end
+                ).scalar() or 0
+                appt.serial_number = int(max_serial) + 1
+                appt.estimated_visit_time = appt.start_time
+            except Exception:
+                appt.serial_number = (appt.serial_number or 0) + 1
+                appt.estimated_visit_time = appt.start_time
+
+        # Finally mark appointment approved and payment_status if payments exist
+        appt.status = AppointmentStatus.approved
+        try:
+            existing_cnt = db.query(Payment).filter(Payment.appointment_id == appt.id).count()
+            if existing_cnt > 0:
+                appt.payment_status = PaymentStatus.paid
+        except Exception:
+            pass
+
+        appt.last_modified_by_user_id = curr.id
+        appt.last_modified_at = datetime.utcnow()
+
+        # persist
+        try:
+            db.commit()
+            db.refresh(appt)
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to save appointment: {e}")
+
+        # Optionally notify patient (best-effort)
+        try:
+            patient_user_id = appt.patient.user_id if appt.patient else None
+            if patient_user_id:
+                tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id == patient_user_id).all()
+                tokens = [t.token for t in tokens_q if t and t.token]
+                if tokens:
+                    title = "Appointment Approved"
+                    serial_disp = appt.serial_number or ""
+                    when_disp = (appt.estimated_visit_time.strftime("%Y-%m-%d %I:%M %p") if appt.estimated_visit_time else "")
+                    body_text = f"Your appointment #{appt.id} has been approved. Serial: {serial_disp}. Est: {when_disp}"
+                    data_payload = {
+                        "type": "appointment_approved",
+                        "appointment_id": str(appt.id),
+                        "serial_number": str(serial_disp),
+                        "estimated_visit_time": appt.estimated_visit_time.isoformat() if appt.estimated_visit_time else "",
+                        "message": body_text,
+                    }
+                    try:
+                        multicast = messaging.MulticastMessage(
+                            notification=messaging.Notification(title=title, body=body_text),
+                            data={k: str(v) for k, v in data_payload.items()},
+                            tokens=list(set(tokens)),
+                        )
+                        messaging.send_multicast(multicast)
+                    except Exception:
+                        try:
+                            fcm_send_data_tokens(db, tokens, data_payload, ttl_seconds=3600)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    else:
+        # Reject flow
+        reason = getattr(body, 'reason', None) if hasattr(body, 'reason') else None
+        appt.status = AppointmentStatus.rejected
+        if reason:
+            appt.notes = (appt.notes or "") + ("\n\nREJECTED: " + reason)
+        appt.last_modified_by_user_id = curr.id
+        appt.last_modified_at = datetime.utcnow()
+        try:
+            db.commit()
+            db.refresh(appt)
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to reject appointment: {e}")
+
+    # Build response similar to earlier behaviour (payments summary, doctor/patient info)
+    payments_rows = db.query(Payment).filter(Payment.appointment_id == appt.id).order_by(Payment.paid_at.desc()).all()
+    payments_items = []
+    payments_total = 0.0
+    for p in payments_rows:
+        amt = float(p.amount) if (p.amount is not None) else 0.0
+        payments_total += amt
+        payments_items.append({
+            "id": p.id,
+            "transaction_id": p.transaction_id,
+            "method": p.method,
+            "amount": p.amount,
+            "status": p.status.value if p.status else None,
+            "paid_at": p.paid_at,
+            "raw": p.raw,
+        })
+
+    doctor_name = None
+    doctor_phone = None
+    if appt.doctor:
+        try:
+            doctor_name = appt.doctor.user.name if appt.doctor.user else None
+            doctor_phone = appt.doctor.user.phone if appt.doctor.user else None
+        except Exception:
+            doctor_name = None
+            doctor_phone = None
+
+    patient_name = None
+    if appt.patient:
+        try:
+            patient_name = appt.patient.user.name if appt.patient.user else None
+        except Exception:
+            patient_name = None
+
+    resp = {
+        "id": appt.id,
+        "doctor_id": appt.doctor_id,
+        "patient_id": appt.patient_id,
+        "patient_name": patient_name,
+        "doctor_name": doctor_name,
+        "start_time": appt.start_time,
+        "end_time": appt.end_time,
+        "status": appt.status.value,
+        "payment_status": appt.payment_status.value,
+        "visit_mode": appt.visit_mode.value if appt.visit_mode else None,
+        "patient_problem": appt.patient_problem,
+        "notes": appt.notes,
+        "progress": appt.progress.value if appt.progress else None,
+        "serial_number": appt.serial_number,
+        "estimated_visit_time": appt.estimated_visit_time,
+        "payments": {
+            "total": payments_total,
+            "count": len(payments_items),
+            "items": payments_items,
+        },
+    }
+
+    return resp
+
+# ------------------ New admin payments listing endpoint ------------------
+@app.get("/admin/payments", response_model=dict)
+def admin_list_payments(
+    q: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    db: Session = Depends(get_db),
+    curr: User = Depends(require_role(UserRole.admin))
+):
+    """
+    Admin listing of payments with simple search (transaction_id, method, patient name/email, appointment id).
+    Returns paginated result:
+      { ok: true, page, page_size, total, items: [ { id, transaction_id, method, amount, status, paid_at, appointment_id, patient_name, patient_id } ] }
+    """
+    base = db.query(Payment).join(Appointment, Payment.appointment_id == Appointment.id).join(Patient, Appointment.patient_id == Patient.id).join(User, Patient.user_id == User.id)
+
+    if q:
+        q_str = f"%{q.strip().lower()}%"
+        # search transaction_id, method, patient name/email, appointment id
+        try:
+            appt_id_int = int(q.strip())
+        except Exception:
+            appt_id_int = None
+
+        base = base.filter(
+            or_(
+                func.lower(Payment.transaction_id).ilike(q_str),
+                func.lower(Payment.method).ilike(q_str),
+                func.lower(User.name).ilike(q_str),
+                func.lower(User.email).ilike(q_str),
+                (Payment.appointment_id == appt_id_int) if appt_id_int is not None else text("0=1")
+            )
+        )
+
+    total = base.count()
+    rows = base.order_by(Payment.paid_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    items = []
+    for p in rows:
+        appt = p.appointment
+        patient_name = ""
+        patient_id = None
+        if appt and appt.patient:
+            patient_id = appt.patient.id
+            try:
+                patient_name = appt.patient.user.name if appt.patient.user else ""
+            except Exception:
+                patient_name = ""
+        items.append({
+            "id": p.id,
+            "transaction_id": p.transaction_id,
+            "method": p.method,
+            "amount": p.amount,
+            "status": p.status.value if p.status else None,
+            "paid_at": p.paid_at,
+            "appointment_id": p.appointment_id,
+            "patient_id": patient_id,
+            "patient_name": patient_name,
+        })
+
+    return {"ok": True, "page": page, "page_size": page_size, "total": total, "items": items}
 
 # -----------------------------------------------------------------------------
 # Doctor — Schedules (flexible JSON/Form)
@@ -2024,31 +2445,54 @@ def request_appointment_multipart(
 @app.get("/appointments/{appointment_id}", response_model=dict)
 def get_appointment(appointment_id: int, current: User = Depends(get_current_user), db: Session = Depends(get_db)):
     a = db.get(Appointment, appointment_id)
-    if not a: raise HTTPException(404, "Appointment not found")
+    if not a:
+        raise HTTPException(404, "Appointment not found")
     allowed = (
-        current.role == UserRole.admin or
-        (current.role == UserRole.doctor and a.doctor.user_id == current.id) or
-        (current.role == UserRole.patient and a.patient.user_id == current.id)
+        current.role == UserRole.admin
+        or (current.role == UserRole.doctor and a.doctor and a.doctor.user_id == current.id)
+        or (current.role == UserRole.patient and a.patient and a.patient.user_id == current.id)
     )
-    if not allowed: raise HTTPException(403, "Forbidden")
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+
+    # Build payments list and total
+    rows = db.query(Payment).filter(Payment.appointment_id == appointment_id).order_by(Payment.paid_at.desc()).all()
+    payments = []
+    payments_total = 0.0
+    for p in rows:
+        amt = float(p.amount) if (p.amount is not None) else 0.0
+        payments_total += amt
+        payments.append({
+            "id": p.id,
+            "transaction_id": p.transaction_id,
+            "method": p.method,
+            "amount": p.amount,
+            "status": p.status.value if p.status else None,
+            "paid_at": p.paid_at,
+            "raw": p.raw,
+        })
+
     return {
         "id": a.id,
         "doctor_id": a.doctor_id,
         "patient_id": a.patient_id,
         "patient_name": a.patient.user.name if a.patient and a.patient.user else "",
-        "doctor_name": a.doctor.user.name if a.doctor and a.doctor.user else "", 
-
-        "start_time": a.start_time, 
+        "doctor_name": a.doctor.user.name if a.doctor and a.doctor.user else "",
+        "start_time": a.start_time,
         "end_time": a.end_time,
-        "status": a.status.value, 
+        "status": a.status.value,
         "payment_status": a.payment_status.value,
-        "visit_mode": a.visit_mode.value, 
+        "visit_mode": a.visit_mode.value,
         "patient_problem": a.patient_problem,
-        "notes": a.notes, 
-        "video_room": a.video_room, 
+        "notes": a.notes,
+        "video_room": a.video_room,
         "progress": a.progress.value,
         "completed_at": a.completed_at,
-        "payment": {"amount": a.payment.amount if a.payment else None} if a.payment else None,
+        # NEW: serial and estimated visiting time
+        "serial_number": a.serial_number,
+        "estimated_visit_time": a.estimated_visit_time,
+        # payments summary
+        "payments": {"total": payments_total, "count": len(payments), "items": payments},
         "doctor": {
             "name": a.doctor.user.name if a.doctor and a.doctor.user else "",
             "phone": (a.doctor.user.phone if a.doctor and a.doctor.user else None),
@@ -2075,10 +2519,10 @@ async def pay_for_appointment(
     if not appt:
         raise HTTPException(404, "Appointment not found")
 
-    if not ((current.role == UserRole.patient and appt.patient.user_id == current.id) or current.role == UserRole.admin):
+    if not ((current.role == UserRole.patient and appt.patient and appt.patient.user_id == current.id) or current.role == UserRole.admin):
         raise HTTPException(403, "Forbidden")
 
-    # JSON first
+    # Parse JSON first
     body: Optional[PaymentIn] = None
     raw = await request.body()
     if raw:
@@ -2093,19 +2537,27 @@ async def pay_for_appointment(
     # Fallback to form
     if body is None:
         form = await request.form()
-        tx = form.get("transaction_id")
-        method = form.get("method")
+        tx = (form.get("transaction_id") or "").strip()
+        method = (form.get("method") or "").strip()
         amount_raw = form.get("amount")
-        raw_field = form.get("raw")
+        raw_field = form.get("raw") or ""
         amount_val: Optional[float] = None
-        if amount_raw is not None:
+        if amount_raw is not None and amount_raw != "":
             try:
                 amount_val = float(amount_raw)
             except Exception:
                 amount_val = None
 
-        if not tx or not method:
-            raise HTTPException(422, "transaction_id and method are required")
+        # If cash, transaction_id may be empty; else require tx+method.
+        if not method:
+            raise HTTPException(422, "method is required")
+        method_lower = method.lower()
+        if method_lower != "cash" and not tx:
+            raise HTTPException(422, "transaction_id is required for non-cash payments")
+
+        # For cash with missing tx, generate one so DB not-null constraint satisfied
+        if method_lower == "cash" and not tx:
+            tx = f"CASH-{secrets.token_urlsafe(6)}"
 
         body = PaymentIn(
             transaction_id=str(tx),
@@ -2114,29 +2566,43 @@ async def pay_for_appointment(
             raw=str(raw_field or ""),
         )
 
-    if appt.payment:
-        appt.payment.transaction_id = body.transaction_id
-        appt.payment.method = body.method
-        appt.payment.amount = body.amount
-        appt.payment.status = PaymentStatus.paid
-        appt.payment.paid_at = datetime.utcnow()
-        appt.payment.raw = body.raw or ""
-    else:
-        db.add(Payment(
+    # At this point body.method must be present
+    method_lower = (body.method or "").strip().lower()
+    tx_val = (body.transaction_id or "").strip()
+
+    # For non-cash methods, transaction_id is mandatory
+    if method_lower != "cash" and not tx_val:
+        raise HTTPException(422, "transaction_id is required for non-cash payments")
+
+    # For cash, generate if not provided
+    if method_lower == "cash" and not tx_val:
+        tx_val = f"CASH-{secrets.token_urlsafe(6)}"
+
+    # Append a new Payment row (do not overwrite existing)
+    try:
+        pay = Payment(
             appointment_id=appointment_id,
-            transaction_id=body.transaction_id,
+            transaction_id=tx_val,
             method=body.method,
             amount=body.amount,
             status=PaymentStatus.paid,
             paid_at=datetime.utcnow(),
             raw=body.raw or "",
-        ))
+        )
+        db.add(pay)
 
-    appt.payment_status = PaymentStatus.paid
-    appt.last_modified_by_user_id = current.id
-    appt.last_modified_at = datetime.utcnow()
-    db.commit()
-    return {"ok": True}
+        # mark appointment paid (business rule)
+        appt.payment_status = PaymentStatus.paid
+        appt.last_modified_by_user_id = current.id
+        appt.last_modified_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(pay)
+        db.refresh(appt)
+        return {"ok": True, "payment_id": pay.id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Failed to record payment: {e}")
 
 # near other endpoints in app.py
 import traceback
@@ -2199,31 +2665,29 @@ def get_payment_for_appointment(
 
     allowed = (
         current.role == UserRole.admin
-        or (current.role == UserRole.patient and appt.patient.user_id == current.id)
-        or (current.role == UserRole.doctor and appt.doctor.user_id == current.id)
+        or (current.role == UserRole.patient and appt.patient and appt.patient.user_id == current.id)
+        or (current.role == UserRole.doctor and appt.doctor and appt.doctor.user_id == current.id)
     )
     if not allowed:
         raise HTTPException(403, "Forbidden")
 
-    if not appt.payment:
-        return {
-            "ok": True,
-            "payment": None,
-            "payment_status": appt.payment_status.value,
-        }
+    rows = db.query(Payment).filter(Payment.appointment_id == appointment_id).order_by(Payment.paid_at.desc()).all()
+    items = []
+    total = 0.0
+    for p in rows:
+        amt = float(p.amount) if (p.amount is not None) else 0.0
+        total += amt
+        items.append({
+            "id": p.id,
+            "transaction_id": p.transaction_id,
+            "method": p.method,
+            "amount": p.amount,
+            "status": p.status.value if p.status else "paid",
+            "paid_at": p.paid_at,
+            "raw": p.raw,
+        })
 
-    return {
-        "ok": True,
-        "payment_status": appt.payment_status.value,
-        "payment": {
-            "transaction_id": appt.payment.transaction_id,
-            "method": appt.payment.method,
-            "amount": appt.payment.amount,
-            "status": appt.payment.status.value,
-            "paid_at": appt.payment.paid_at,
-            "raw": appt.payment.raw,
-        },
-    }
+    return {"ok": True, "payment_status": appt.payment_status.value, "total": total, "count": len(items), "items": items}
 
 # ---- Payments listing (patient) + PDF receipt --------------------------------
 from fastapi import Query as _Query  # avoid name clash
@@ -2256,121 +2720,434 @@ def _human(dt: Optional[datetime]) -> str:
     except Exception:
         return dt.strftime("%Y %b %d • %I:%M %p").lstrip("0")
 
-def _render_receipt_pdf(pay: Payment) -> bytes:
-    appt = pay.appointment
-    doc_user = appt.doctor.user if (appt and appt.doctor) else None
-    pat_user = appt.patient.user if (appt and appt.patient) else None
+import os
+from io import BytesIO
+from typing import Any, Iterable, Optional
+
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.graphics.barcode.code128 import Code128
+from reportlab.lib.utils import simpleSplit
+
+
+# ---------- Fonts ----------
+_FONT_READY = False
+
+def _register_fonts():
+    global _FONT_READY
+    if _FONT_READY:
+        return
+
+    base = os.path.join(os.getcwd(), "assets", "fonts")
+    regular = os.path.join(base, "DejaVuSans.ttf")
+    bold = os.path.join(base, "DejaVuSans-Bold.ttf")
+    mono = os.path.join(base, "DejaVuSansMono.ttf")
+    emoji = os.path.join(base, "NotoEmoji-Regular.ttf")
+
     try:
-        mode = (appt.visit_mode.value if hasattr(appt.visit_mode, "value") else appt.visit_mode) or ""
+        if os.path.exists(regular):
+            pdfmetrics.registerFont(TTFont("DV", regular))
+        if os.path.exists(bold):
+            pdfmetrics.registerFont(TTFont("DVB", bold))
+        if os.path.exists(mono):
+            pdfmetrics.registerFont(TTFont("DVM", mono))
+        if os.path.exists(emoji):
+            pdfmetrics.registerFont(TTFont("EMJ", emoji))
+    except Exception:
+        pass
+
+    _FONT_READY = True
+
+def _font(name: str) -> str:
+    regs = set(pdfmetrics.getRegisteredFontNames())
+    if name in regs:
+        return name
+    return {"DV": "Helvetica", "DVB": "Helvetica-Bold", "DVM": "Courier"}.get(name, "Helvetica")
+
+
+# ---------- Helpers ----------
+def _safe_enum_value(x: Any) -> str:
+    if x is None:
+        return ""
+    try:
+        return x.value if hasattr(x, "value") else str(x)
+    except Exception:
+        return ""
+
+def _get_name(obj: Any) -> str:
+    """SQLAlchemy-friendly: obj.name -> obj.user.name -> obj.profile.name"""
+    if obj is None:
+        return ""
+    for getter in (
+        lambda o: getattr(o, "name", None),
+        lambda o: getattr(getattr(o, "user", None), "name", None),
+        lambda o: getattr(getattr(o, "profile", None), "name", None),
+    ):
+        try:
+            v = getter(obj)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        except Exception:
+            pass
+    return ""
+
+def _titleize(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if any(ch.isupper() for ch in s[1:]):
+        return s
+    return " ".join(w.capitalize() for w in s.replace("_", " ").split())
+
+def _get_original_app_name(default: str = "RxMeet") -> str:
+    """
+    Priority:
+      1) Django settings
+      2) Env vars
+      3) Project folder name
+      4) Default
+    """
+    # Django settings (if available)
+    try:
+        from django.conf import settings  # type: ignore
+        for key in (
+            "APP_DISPLAY_NAME",
+            "APP_NAME",
+            "SITE_NAME",
+            "PROJECT_NAME",
+            "BRAND_NAME",
+            "APPLICATION_NAME",
+        ):
+            v = getattr(settings, key, None)
+            if isinstance(v, str) and v.strip():
+                return _titleize(v)
+    except Exception:
+        pass
+
+    # Env vars
+    for key in (
+        "APP_DISPLAY_NAME",
+        "APP_NAME",
+        "SITE_NAME",
+        "PROJECT_NAME",
+        "BRAND_NAME",
+        "APPLICATION_NAME",
+    ):
+        v = os.getenv(key)
+        if v and v.strip():
+            return _titleize(v)
+
+    # Folder name (often the real app name)
+    try:
+        folder = os.path.basename(os.getcwd())
+        if folder and folder.strip():
+            return _titleize(folder)
+    except Exception:
+        pass
+
+    return _titleize(default) if default else "RxMeet"
+
+def _date_only(dt: Any) -> str:
+    try:
+        if dt is None:
+            return "—"
+        if hasattr(dt, "date"):
+            d = dt.date()
+        else:
+            d = dt
+        return d.strftime("%d %b %Y")
+    except Exception:
+        return "—"
+
+def _time_only(dt: Any) -> str:
+    try:
+        if dt is None:
+            return ""
+        s = dt.strftime("%I:%M %p").lstrip("0")
+        return s
+    except Exception:
+        return ""
+
+def _time_range_only(start: Any, end: Any) -> str:
+    s = _time_only(start)
+    e = _time_only(end)
+    if s and e:
+        return f"{s} – {e}"
+    if s:
+        return s
+    return "—"
+
+def _draw_wrapped(
+    c: canvas.Canvas,
+    text: str,
+    x: float,
+    y: float,
+    max_w: float,
+    font: str,
+    size: int,
+    leading: float,
+) -> float:
+    c.setFont(font, size)
+    lines = simpleSplit(text or "", font, size, max_w)
+    for ln in lines:
+        c.drawString(x, y, ln)
+        y -= leading
+    return y
+
+def _kv_block(
+    c: canvas.Canvas,
+    x: float,
+    y: float,
+    w: float,
+    title: str,
+    rows: list[tuple[str, str]],
+    *,
+    bold_value_keys: Optional[Iterable[str]] = None,
+) -> float:
+    pad = 10
+    header_h = 22
+    row_gap = 10
+    label_w = 150
+    value_w = w - pad * 2 - label_w - 10
+
+    font_label = _font("DVB")
+    font_value = _font("DV")
+    font_value_bold = _font("DVB")
+    size_label = 9
+    size_value = 10
+    leading = 13
+
+    bold_set = set(bold_value_keys or [])
+
+    # estimate height
+    h = header_h + pad
+    for _, v in rows:
+        vv = v or "—"
+        v_lines = simpleSplit(vv, font_value, size_value, value_w)
+        h += max(leading * len(v_lines), leading) + 2
+    h += pad
+
+    c.setStrokeColor(colors.HexColor("#E6E8EC"))
+    c.setFillColor(colors.white)
+    c.roundRect(x, y - h, w, h, 10, stroke=1, fill=1)
+
+    c.setFillColor(colors.HexColor("#F6F7F9"))
+    c.roundRect(x, y - header_h, w, header_h, 10, stroke=0, fill=1)
+
+    c.setFillColor(colors.HexColor("#111827"))
+    c.setFont(_font("DVB"), 11)
+    c.drawString(x + pad, y - 15, title)
+
+    yy = y - header_h - 14
+    for k, v in rows:
+        c.setFillColor(colors.HexColor("#6B7280"))
+        c.setFont(font_label, size_label)
+        c.drawString(x + pad, yy, k)
+
+        vv = (v.strip() if isinstance(v, str) and v.strip() else "—")
+        use_font = font_value_bold if k in bold_set else font_value
+
+        c.setFillColor(colors.HexColor("#111827"))
+        yy2 = _draw_wrapped(
+            c, vv, x + pad + label_w, yy, value_w, use_font, size_value, leading
+        )
+        yy = yy2 - 2
+
+    return y - h - row_gap
+
+
+def _render_receipt_pdf(pay: "Payment") -> bytes:
+    _register_fonts()
+
+    appt = getattr(pay, "appointment", None)
+    doctor = getattr(appt, "doctor", None) if appt else None
+    patient = getattr(appt, "patient", None) if appt else None
+
+    doctor_name = _get_name(doctor) or "—"
+    patient_name = _get_name(patient) or "—"
+
+    appt_id = getattr(appt, "id", None) if appt else None
+    serial_no = getattr(appt, "serial_number", None) if appt else None
+    approx_time = getattr(appt, "estimated_visit_time", None) if appt else None
+
+    mode = ""
+    try:
+        mode = _safe_enum_value(getattr(appt, "visit_mode", "")) if appt else ""
     except Exception:
         mode = ""
 
-    lines = [
-        ("title", "Payment Receipt"),
-        ("sp", ""),
-        ("kv", f"Transaction ID: {pay.transaction_id}"),
-        ("kv", f"Amount: {'' if pay.amount is None else f'{pay.amount:.2f}'}"),
-        ("kv", f"Method: {pay.method or ''}"),
-        ("kv", f"Status: {pay.status.value if pay.status else 'paid'}"),
-        ("kv", f"Paid at: {_human(pay.paid_at)}"),
-        ("sp", ""),
-        ("section", "Appointment"),
-        ("kv", f"Number: #{appt.id if appt else ''}"),
-        ("kv", f"Doctor: {doc_user.name if doc_user else ''}"),
-        ("kv", f"Patient: {pat_user.name if pat_user else ''}"),
-        ("kv", f"Mode: {mode}"),
-        ("kv", f"When: {_human(appt.start_time) if appt else ''}"),
-    ]
+    txn = getattr(pay, "transaction_id", "") or ""
+    method = _safe_enum_value(getattr(pay, "method", "")) or ""
+    status = _safe_enum_value(getattr(pay, "status", None)) or "paid"
+    paid_at = _human(getattr(pay, "paid_at", None))
 
-    if _HAS_RL:
-        buf = BytesIO()
-        c = canvas.Canvas(buf, pagesize=A4)
-        w, h = A4
-        y = h - 60
+    amount = getattr(pay, "amount", None)
+    amount_str = "—" if amount is None else f"{amount:.2f}"
 
-        def draw_line(txt: str, lh: int = 20, bold: bool = False):
-            nonlocal y
-            c.setFont("Helvetica-Bold" if bold else "Helvetica", 12)
-            c.drawString(40, y, txt)
-            y -= lh
+    start_time = getattr(appt, "start_time", None) if appt else None
+    end_time = getattr(appt, "end_time", None) if appt else None
 
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(40, y, "Payment Receipt")
-        y -= 30
+    # Appointment date shown once (top)
+    appt_date_str = _date_only(start_time)
 
-        for kind, text in lines[2:]:
-            if kind == "sp":
-                y -= 8
-                continue
-            if kind == "section":
-                y -= 6
-                c.setFont("Helvetica-Bold", 14)
-                c.drawString(40, y, text)
-                y -= 22
-                continue
-            draw_line(text)
+    # Appointment time: time-only range
+    appt_time_str = _time_range_only(start_time, end_time)
 
-        c.showPage(); c.save()
-        pdf = buf.getvalue(); buf.close()
-        return pdf
+    serial_str = str(serial_no) if serial_no else "—"
+    approx_str = _time_only(approx_time) or "—"
 
-    # Minimal dependency-free PDF
-    def _esc(s: str) -> str:
-        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    app_name = _get_original_app_name(default="RxMeet")
 
-    parts = []
-    parts.append("BT")
-    parts.append("/F1 18 Tf 50 800 Td 20 TL")
-    parts.append(f"({_esc(lines[0][1])}) Tj")
-    parts.append("/F1 12 Tf 0 -26 Td 18 TL")
+    # Barcode: appointment number only
+    barcode_data = str(appt_id or "").strip() or "0"
 
-    for kind, text in lines[2:]:
-        if kind == "sp":
-            parts.append("T*")
-            continue
-        if kind == "section":
-            parts.append("/F1 14 Tf T*")
-            parts.append(f"({_esc(text)}) Tj")
-            parts.append("/F1 12 Tf 0 -4 Td")
-            continue
-        parts.append("T*")
-        parts.append(f"({_esc(text)}) Tj")
+    note_text = "Note: Visiting time is approximate. Actual visit may be before or after this time."
 
-    parts.append("ET")
-    stream_str = ("\n".join(parts)).encode("latin1", "ignore")
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
 
-    header = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n"
-    objs = []
-    xref = []
+    margin_x = 18 * mm
+    top = H - 18 * mm
+    content_w = W - 2 * margin_x
 
-    def add_obj(b: bytes):
-        pos = len(header) + sum(len(o) for o in objs)
-        xref.append(pos)
-        objs.append(b)
+    # Header row
+    c.setFillColor(colors.HexColor("#111827"))
+    c.setFont(_font("DVB"), 18)
+    c.drawString(margin_x, top, "Payment Receipt")
 
-    add_obj(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
-    add_obj(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
-    add_obj(
-        b"3 0 obj << /Type /Page /Parent 2 0 R "
-        b"/MediaBox [0 0 595 842] /Contents 4 0 R "
-        b"/Resources << /Font << /F1 5 0 R >> >> >> endobj\n"
-    )
-    add_obj(
-        f"4 0 obj << /Length {len(stream_str)} >> stream\n".encode()
-        + stream_str
-        + b"\nendstream\nendobj\n"
-    )
-    add_obj(b"5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    # App name (center, professional, no "App:")
+    c.setFont(_font("DVB"), 12)
+    c.setFillColor(colors.HexColor("#111827"))
+    c.drawCentredString(W / 2, top + 2, app_name)
 
-    xref_pos = len(header) + sum(len(o) for o in objs)
-    xref_tbl = f"xref\n0 {len(xref)+1}\n0000000000 65535 f \n"
-    for pos in xref:
-        xref_tbl += f"{pos:010d} 00000 n \n"
-    trailer = (
-        f"trailer << /Size {len(xref)+1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode()
+    # Appointment date (right)
+    c.setFont(_font("DV"), 10)
+    c.setFillColor(colors.HexColor("#6B7280"))
+    c.drawRightString(W - margin_x, top + 2, f"Appointment Date: {appt_date_str}")
+
+    # Divider
+    c.setStrokeColor(colors.HexColor("#E6E8EC"))
+    c.setLineWidth(1)
+    c.line(margin_x, top - 10, W - margin_x, top - 10)
+
+    y = top - 26
+
+    # Summary left + Barcode right
+    gap = 10
+    left_w = (content_w - gap) * 0.54
+    right_w = (content_w - gap) - left_w
+
+    y = _kv_block(
+        c,
+        margin_x,
+        y,
+        left_w,
+        "Summary",
+        [
+            ("Doctor", doctor_name),
+            ("Patient", patient_name),
+            ("Receipt ID", txn or "—"),
+            ("Issued", paid_at or "—"),
+            ("Appointment", f"#{appt_id}" if appt_id else "—"),
+        ],
+        bold_value_keys=("Doctor", "Patient"),
     )
 
-    return header + b"".join(objs) + xref_tbl.encode() + trailer
+    card_x = margin_x + left_w + gap
+    card_w = right_w
+    card_h = 86
+    card_y_top = (top - 26)
+
+    c.setStrokeColor(colors.HexColor("#E6E8EC"))
+    c.setFillColor(colors.white)
+    c.roundRect(card_x, card_y_top - card_h, card_w, card_h, 10, stroke=1, fill=1)
+
+    c.setFillColor(colors.HexColor("#F6F7F9"))
+    c.roundRect(card_x, card_y_top - 22, card_w, 22, 10, stroke=0, fill=1)
+
+    c.setFillColor(colors.HexColor("#111827"))
+    c.setFont(_font("DVB"), 11)
+    c.drawString(card_x + 10, card_y_top - 15, "Appointment Barcode")
+
+    bc = Code128(barcode_data, barHeight=32, barWidth=0.9)
+    bc.drawOn(c, card_x + 12, card_y_top - card_h + 18)
+
+    c.setFont(_font("DVM"), 9)
+    c.setFillColor(colors.HexColor("#374151"))
+    c.drawString(card_x + 12, card_y_top - card_h + 10, f"#{barcode_data}")
+
+    y = min(y, card_y_top - card_h - 10)
+
+    # Payment block
+    y = _kv_block(
+        c,
+        margin_x,
+        y,
+        content_w,
+        "Payment",
+        [
+            ("Transaction ID", txn or "—"),
+            ("Amount", amount_str),
+            ("Method", method or "—"),
+            ("Status", status or "—"),
+            ("Paid at", paid_at or "—"),
+        ],
+    )
+
+    # Appointment block
+    y = _kv_block(
+        c,
+        margin_x,
+        y,
+        content_w,
+        "Appointment",
+        [
+            ("Number", f"#{appt_id}" if appt_id else "—"),
+            ("Doctor", doctor_name),
+            ("Patient", patient_name),
+            ("Mode", mode or "—"),
+            ("Appointment time", appt_time_str),
+            ("Serial number", serial_str),
+            ("Approx. visiting time", approx_str),
+        ],
+        bold_value_keys=("Doctor", "Patient"),
+    )
+
+    # Note (always visible; if too low, put it on a new page)
+    note_y = y
+    if note_y < 28 * mm:
+        c.showPage()
+        # simple header on note-only page
+        c.setFillColor(colors.HexColor("#111827"))
+        c.setFont(_font("DVB"), 14)
+        c.drawString(margin_x, H - 22 * mm, "Payment Receipt")
+        c.setFont(_font("DV"), 11)
+        c.drawCentredString(W / 2, H - 22 * mm + 2, app_name)
+        note_y = H - 40 * mm
+
+    c.setFillColor(colors.HexColor("#6B7280"))
+    _draw_wrapped(
+        c,
+        note_text,
+        margin_x,
+        note_y,
+        content_w,
+        _font("DV"),
+        9,
+        12,
+    )
+
+    c.showPage()
+    c.save()
+
+    pdf = buf.getvalue()
+    buf.close()
+    return pdf
 
 def _list_payments_for_patient(db: Session, current: User, page: int, page_size: int):
     if current.role != UserRole.patient:
@@ -2473,20 +3250,54 @@ def list_my_payments_alias5(
 @app.get("/payments/{payment_id}/receipt")
 def payment_receipt(
     payment_id: int,
-    current: User = Depends(get_current_user),
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    """
+    Return PDF receipt for a payment.
+
+    Authentication:
+      - Normal mode: client sends Authorization: Bearer <token> (preferred)
+      - Browser/dev mode: client may append ?token=<access_token> (convenience for dev)
+        NOTE: Passing tokens in URLs is less secure — use only for short-lived dev/testing.
+    """
+    # Try Authorization header first
+    auth_header = request.headers.get("Authorization") or ""
+    token = None
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    else:
+        # Fallback to query param for convenience: ?token=... or ?access_token=...
+        token = (request.query_params.get("token") or request.query_params.get("access_token") or "").strip()
+
+    current_user = None
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+            uid = int(payload.get("sub"))
+            current_user = db.get(User, uid)
+        except Exception:
+            # decode failed; we'll treat as unauthenticated below
+            current_user = None
+
+    if not current_user:
+        raise HTTPException(401, detail="Not authenticated")
+
     pay = db.get(Payment, payment_id)
     if not pay:
         raise HTTPException(404, "Payment not found")
-    _ensure_can_view_payment(current, pay)
 
+    # permission check
+    _ensure_can_view_payment(current_user, pay)
+
+    # Render PDF and return
     pdf = _render_receipt_pdf(pay)
     return Response(
         content=pdf,
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="receipt-{payment_id}.pdf"'},
     )
+
 # ---- / Payments listing + PDF -----------------------------------------------
 
 @app.post("/appointments/{appointment_id}/video/start", response_model=dict)
@@ -3924,8 +4735,281 @@ from pydantic import BaseModel
 class MessageIn(BaseModel):
     body: str
     kind: Optional[str] = "text"
+# ------------------------- Chat: model, helpers, endpoints -------------------------
+# Place this block in app.py (replace your existing chat block). It depends on:
+# - sqlalchemy.orm Session, text, engine, Base
+# - models: User, Appointment, DeviceToken, Message
+# - firebase_admin.messaging as messaging
+# - get_current_user, get_db, datetime, os
+from typing import List, Optional, Set, Dict
+from fastapi import Request, UploadFile, File, Form, Query, HTTPException
+from sqlalchemy import text
+from datetime import datetime
+import os
+import time
 
-# List messages with simple paging
+# firebase_admin.messaging should already be imported as `messaging`
+# If not, add:
+# from firebase_admin import messaging
+
+# Appointment-scoped chat (file-capable)
+class AppointmentMessage(Base):
+    __tablename__ = "appointment_messages"
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False, index=True)
+    sender_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    body = Column(Text, default="")
+    file_path = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # optional relationships
+    appointment = relationship("Appointment")
+    sender = relationship("User")
+
+
+# SQLite auto-create helper for appointment_messages (idempotent)
+def _ensure_messages_table(conn):
+    rows = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='appointment_messages'")).all()
+    if not rows:
+        conn.execute(text("""
+            CREATE TABLE appointment_messages (
+                id INTEGER PRIMARY KEY,
+                appointment_id INTEGER NOT NULL,
+                sender_user_id INTEGER NOT NULL,
+                body TEXT DEFAULT '',
+                file_path TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """))
+
+
+# Ensure table exists at startup (idempotent)
+try:
+    if engine.url.get_backend_name() == "sqlite":
+        with engine.begin() as conn:
+            _ensure_messages_table(conn)
+except Exception:
+    pass
+
+
+# --- small in-process dedupe cache to avoid rapid duplicate notifications ----
+_recent_notifications: Dict[str, float] = {}
+
+def _should_send_notification(key: str, window_seconds: float = 2.0) -> bool:
+    """
+    Returns True if we should send (and records now). If the same key
+    was sent within the last `window_seconds`, returns False.
+    """
+    try:
+        now = time.time()
+        last = _recent_notifications.get(key)
+        if last is None or (now - last) > window_seconds:
+            _recent_notifications[key] = now
+            # prune occasional old entries to keep memory small
+            if len(_recent_notifications) > 5000:
+                cutoff = now - 60.0
+                for k in list(_recent_notifications.keys()):
+                    if _recent_notifications.get(k, 0) < cutoff:
+                        _recent_notifications.pop(k, None)
+            return True
+        else:
+            return False
+    except Exception:
+        return True
+
+
+def _get_user_device_tokens(db: Session, user_id: int) -> List[str]:
+    """Return list of tokens for user (deduped)."""
+    try:
+        rows = db.query(DeviceToken).filter(DeviceToken.user_id == user_id).all()
+        tokens = [r.token for r in rows if r and r.token]
+        # dedupe while preserving order
+        out: List[str] = []
+        seen = set()
+        for t in tokens:
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+    except Exception:
+        return []
+
+
+def _prune_bad_tokens(db: Session, bad_tokens: List[str]):
+    """Remove tokens that are invalid/unregistered from DB."""
+    if not bad_tokens:
+        return
+    try:
+        for t in bad_tokens:
+            try:
+                db.query(DeviceToken).filter(DeviceToken.token == t).delete()
+                db.commit()
+            except Exception:
+                db.rollback()
+    except Exception:
+        pass
+
+
+def _notify_chat_message(db: Session, appt: Appointment, msg: AppointmentMessage):
+    """
+    Send a visible notification + data to other participants (doctor/patient) for a chat message.
+    Aggregates tokens for all recipients and sends a single multicast so a token is notified once.
+    """
+    try:
+        # Build dedupe key to avoid rapid double-sends (same user action)
+        text_body = (msg.body or "").strip()
+        snippet = (text_body[:120] if text_body else "") or ("img" if msg.file_path else "")
+        dedupe_key = f"chat:{msg.appointment_id}:{msg.sender_user_id}:{snippet}"
+        if not _should_send_notification(dedupe_key, window_seconds=2.0):
+            print(f"_notify_chat_message: suppressed duplicate key={dedupe_key}")
+            return
+
+        sender = db.get(User, msg.sender_user_id)
+        sender_name = ""
+        if sender:
+            sender_name = getattr(sender, "name", None) or getattr(sender, "full_name", None) or getattr(sender, "display_name", "") or f"User #{sender.id}"
+
+        title = sender_name or "New message"
+        body_text = text_body or ("Image" if msg.file_path else "")
+
+        # Collect recipient user IDs (exclude sender)
+        recipients: Set[int] = set()
+        try:
+            if appt.doctor and getattr(appt.doctor, "user_id", None) and appt.doctor.user_id != msg.sender_user_id:
+                recipients.add(appt.doctor.user_id)
+            if appt.patient and getattr(appt.patient, "user_id", None) and appt.patient.user_id != msg.sender_user_id:
+                recipients.add(appt.patient.user_id)
+        except Exception:
+            pass
+
+        if not recipients:
+            return
+
+        # Aggregate tokens for all recipients and dedupe globally
+        tokens_set: Set[str] = set()
+        for rid in recipients:
+            toks = _get_user_device_tokens(db, rid)
+            for t in toks:
+                if t:
+                    tokens_set.add(t)
+
+        # Remove sender's own tokens (don't notify sender)
+        try:
+            sender_tokens = set(_get_user_device_tokens(db, msg.sender_user_id))
+            tokens_set.difference_update(sender_tokens)
+        except Exception:
+            pass
+
+        tokens = list(tokens_set)
+        if not tokens:
+            return
+
+        data_payload = {
+            "type": "chat_message",
+            "appointment_id": str(msg.appointment_id),
+            "message_id": str(msg.id),
+            "sender_id": str(msg.sender_user_id),
+            "sender_name": sender_name,
+            "body": body_text,
+            "file_path": msg.file_path or "",
+            "created_at": str(msg.created_at),
+        }
+
+        # Visible notification object (ensures OS shows a visible notification)
+        notification_obj = None
+        try:
+            notification_obj = messaging.Notification(title=title, body=body_text)
+        except Exception:
+            notification_obj = None
+
+        # Android config
+        android_cfg = None
+        try:
+            android_cfg = messaging.AndroidConfig(
+                priority="high",
+                ttl=60,
+                notification=messaging.AndroidNotification(
+                    channel_id="chat_channel",
+                    click_action="FLUTTER_NOTIFICATION_CLICK",
+                    sound="default",
+                ),
+            )
+        except Exception:
+            android_cfg = None
+
+        # APNs config (iOS)
+        apns_cfg = None
+        try:
+            apns_cfg = messaging.ApnsConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.ApnsPayload(
+                    aps=messaging.Aps(alert={"title": title, "body": body_text}, sound="default")
+                ),
+            )
+        except Exception:
+            apns_cfg = None
+
+        # Webpush config
+        webpush_cfg = None
+        try:
+            webpush_cfg = messaging.WebpushConfig(
+                headers={"TTL": "60", "Urgency": "high"},
+                notification=messaging.WebpushNotification(title=title, body=body_text),
+            )
+        except Exception:
+            webpush_cfg = None
+
+        # Send single multicast to all recipient tokens
+        multi = messaging.MulticastMessage(
+            notification=notification_obj,
+            data={k: (v or "") for k, v in data_payload.items()},
+            android=android_cfg,
+            apns=apns_cfg,
+            webpush=webpush_cfg,
+            tokens=tokens,
+        )
+
+        try:
+            resp = messaging.send_multicast(multi)
+            # If there are failures, prune NotRegistered tokens
+            bad = []
+            if hasattr(resp, "responses"):
+                for i, r in enumerate(resp.responses):
+                    if not getattr(r, "success", False):
+                        ex = getattr(r, "exception", None)
+                        errstr = str(ex) if ex else ""
+                        tok = tokens[i]
+                        if "NotRegistered" in errstr or "Unregistered" in errstr or "registration-token-not-registered" in errstr:
+                            bad.append(tok)
+                if bad:
+                    _prune_bad_tokens(db, bad)
+        except Exception as e:
+            # Fallback: try per-token send and prune invalid ones
+            bad_tokens = []
+            for t in tokens:
+                try:
+                    kwargs = {"data": {k: (v or "") for k, v in data_payload.items()}, "token": t}
+                    if notification_obj:
+                        kwargs["notification"] = notification_obj
+                    if android_cfg:
+                        kwargs["android"] = android_cfg
+                    if apns_cfg:
+                        kwargs["apns"] = apns_cfg
+                    if webpush_cfg:
+                        kwargs["webpush"] = webpush_cfg
+                    messaging.send(messaging.Message(**kwargs))
+                except Exception as ex2:
+                    err2 = str(ex2)
+                    if "NotRegistered" in err2 or "Unregistered" in err2 or "registration-token-not-registered" in err2:
+                        bad_tokens.append(t)
+            if bad_tokens:
+                _prune_bad_tokens(db, bad_tokens)
+
+    except Exception as e:
+        print("_notify_chat_message error:", e)
+
+
+# ---------- Text chat endpoints (legacy Message table) ----------
 @app.get("/appointments/{appointment_id}/messages", response_model=List[dict])
 def list_messages(appointment_id: int, page: int = 1, page_size: int = 50, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     appt = db.get(Appointment, appointment_id)
@@ -3952,6 +5036,7 @@ def list_messages(appointment_id: int, page: int = 1, page_size: int = 50, db: S
         })
     return out
 
+
 @app.post("/appointments/{appointment_id}/messages", response_model=dict)
 def post_message(appointment_id: int, payload: MessageIn, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     appt = db.get(Appointment, appointment_id)
@@ -3963,7 +5048,6 @@ def post_message(appointment_id: int, payload: MessageIn, db: Session = Depends(
             (current.role == UserRole.patient and appt.patient.user_id == current.id)):
         raise HTTPException(403, "Forbidden")
 
-    # Compute recipient
     recipient_id = None
     if current.role == UserRole.doctor:
         recipient_id = appt.patient.user_id
@@ -3974,7 +5058,7 @@ def post_message(appointment_id: int, payload: MessageIn, db: Session = Depends(
         appointment_id=appointment_id,
         sender_user_id=current.id,
         recipient_user_id=recipient_id,
-        body=payload.body,
+        body=payload.body or "",
         kind=payload.kind or "text",
         created_at=datetime.utcnow(),
         read=False,
@@ -3983,130 +5067,43 @@ def post_message(appointment_id: int, payload: MessageIn, db: Session = Depends(
     db.commit()
     db.refresh(msg)
 
-    # Notify other party via FCM (data-only message)
+    # Notify other party via FCM (convert to AppointmentMessage-like payload)
     try:
-        _notify_chat_message(db, appt, msg)
+        fake_am = AppointmentMessage(
+            appointment_id=msg.appointment_id,
+            sender_user_id=msg.sender_user_id,
+            body=msg.body,
+            file_path=None,
+            created_at=msg.created_at
+        )
+        _notify_chat_message(db, appt, fake_am)
     except Exception as e:
         print('Failed to notify chat recipient:', e)
 
-    return {"ok": True, "message_id": msg.id, "created_at": msg.created_at}
+    return {"ok": True, "message": {
+        "id": msg.id,
+        "appointment_id": msg.appointment_id,
+        "sender_user_id": msg.sender_user_id,
+        "recipient_user_id": msg.recipient_user_id,
+        "body": msg.body,
+        "kind": msg.kind,
+        "read": msg.read,
+        "created_at": msg.created_at
+    }}
+
 
 @app.post("/appointments/{appointment_id}/messages/mark_read", response_model=dict)
 def mark_messages_read(appointment_id: int, db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     appt = db.get(Appointment, appointment_id)
     if not appt:
         raise HTTPException(404, "Appointment not found")
-    # authorization same as above...
     q = db.query(Message).filter(Message.appointment_id == appointment_id, Message.recipient_user_id == current.id, Message.read == False)
     updated = q.update({"read": True}, synchronize_session=False)
     db.commit()
     return {"ok": True, "updated": int(updated)}
 
-# ---------- Chat model + endpoints (patient <-> doctor chat) ----------
-from sqlalchemy import inspect
-from sqlalchemy.exc import OperationalError
 
-class AppointmentMessage(Base):
-    __tablename__ = "appointment_messages"
-    id = Column(Integer, primary_key=True)
-    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False, index=True)
-    sender_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    body = Column(Text, default="")
-    file_path = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # relationships (optional)
-    appointment = relationship("Appointment")
-    sender = relationship("User")
-
-# Add sqlite schema auto-create for appointment_messages
-def _ensure_messages_table(conn):
-    rows = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='appointment_messages'")).all()
-    if not rows:
-        conn.execute(text("""
-            CREATE TABLE appointment_messages (
-                id INTEGER PRIMARY KEY,
-                appointment_id INTEGER NOT NULL,
-                sender_user_id INTEGER NOT NULL,
-                body TEXT DEFAULT '',
-                file_path TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """))
-
-# Extend ensure_sqlite_schema to create table if missing
-def ensure_sqlite_schema_extended(engine):
-    # call original ensure_sqlite_schema first
-    ensure_sqlite_schema(engine)
-    if engine.url.get_backend_name() != "sqlite":
-        return
-    with engine.begin() as conn:
-        try:
-            _ensure_messages_table(conn)
-        except Exception:
-            pass
-
-# If you call ensure_sqlite_schema elsewhere during startup, also call the extended one instead.
-# But to be safe, call it on startup (after ensure_sqlite_schema(engine)): 
-# (In your existing on_startup you already call ensure_sqlite_schema(engine) — update to ensure_sqlite_schema_extended)
-# For minimal change, below we simply call _ensure_messages_table here (idempotent)
-try:
-    if engine.url.get_backend_name() == "sqlite":
-        with engine.begin() as conn:
-            _ensure_messages_table(conn)
-except Exception:
-    pass
-
-# Helper: broadcast chat message to the other participant's tokens
-def _notify_chat_message(db: Session, appt: Appointment, msg: AppointmentMessage):
-    """
-    Notify the other participant (patient or doctor) about a new chat message.
-    Sends a data-only message with type=chat_message.
-    """
-    try:
-        # Determine recipient user ids: both doctor.user_id and patient.user_id
-        recipients = []
-        try:
-            if appt.doctor and appt.doctor.user_id:
-                recipients.append(appt.doctor.user_id)
-        except Exception:
-            pass
-        try:
-            if appt.patient and appt.patient.user_id:
-                recipients.append(appt.patient.user_id)
-        except Exception:
-            pass
-
-        # exclude sender
-        recipients = [u for u in set(recipients) if u != msg.sender_user_id]
-        if not recipients:
-            return
-
-        # fetch tokens
-        tokens_q = db.query(DeviceToken).filter(DeviceToken.user_id.in_(recipients)).all()
-        tokens = [t.token for t in tokens_q if t and t.token]
-        if not tokens:
-            return
-
-        payload = {
-            "type": "chat_message",
-            "appointment_id": str(msg.appointment_id),
-            "message_id": str(msg.id),
-            "sender_id": str(msg.sender_user_id),
-            "body": (msg.body or "")[:200],  # short preview
-        }
-
-        try:
-            # prefer multicast if available
-            fcm_send_data_tokens(db, tokens, payload, ttl_seconds=60)
-        except Exception as e:
-            # best effort
-            print("_notify_chat_message fcm error:", e)
-    except Exception as e:
-        print("_notify_chat_message internal error:", e)
-
-
-# Endpoint: List chat messages for an appointment
+# ---------- Appointment-scoped chat endpoints (with files) ----------
 @app.get("/appointments/{appointment_id}/chat", response_model=dict)
 def list_chat_messages(
     appointment_id: int,
@@ -4145,7 +5142,6 @@ def list_chat_messages(
     return {"ok": True, "page": page, "page_size": page_size, "total": total, "items": out}
 
 
-# Endpoint: Send chat message (text + optional file)
 @app.post("/appointments/{appointment_id}/chat/send", response_model=dict)
 async def send_chat_message(
     appointment_id: int,
@@ -4214,6 +5210,7 @@ async def send_chat_message(
         sender_user_id=current.id,
         body=(text_body or "").strip(),
         file_path=file_path,
+        created_at=datetime.utcnow(),
     )
     db.add(msg)
     db.commit()
@@ -4237,7 +5234,7 @@ async def send_chat_message(
         },
     }
 
-# Endpoint: upload-only helper (multipart-only)
+
 @app.post("/appointments/{appointment_id}/chat/upload", response_model=dict)
 async def upload_chat_file_only(
     appointment_id: int,
@@ -4246,8 +5243,60 @@ async def upload_chat_file_only(
     current: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # reuse send endpoint logic
-    return await send_chat_message(appointment_id, Request(scope=None), file=file, body=(note or ""), current=current, db=db)
+    appt = db.get(Appointment, appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    # permission check, same as send_chat_message
+    allowed = (
+        current.role == UserRole.admin
+        or (current.role == UserRole.doctor and appt.doctor and appt.doctor.user_id == current.id)
+        or (current.role == UserRole.patient and appt.patient and appt.patient.user_id == current.id)
+    )
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+
+    try:
+        fname = f"chat_{appointment_id}_{current.id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{file.filename}"
+        path = os.path.join("uploads", fname)
+        with open(path, "wb") as fh:
+            fh.write(file.file.read())
+        file_path = path
+    except Exception as e:
+        print("chat upload error:", e)
+        raise HTTPException(500, "Failed to save uploaded file")
+
+    # create message row
+    msg = AppointmentMessage(
+        appointment_id=appointment_id,
+        sender_user_id=current.id,
+        body=(note or "").strip(),
+        file_path=file_path,
+        created_at=datetime.utcnow(),
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    # notify other participants
+    try:
+        _notify_chat_message(db, appt, msg)
+    except Exception as e:
+        print("notify_chat_message error:", e)
+
+    return {
+        "ok": True,
+        "message": {
+            "id": msg.id,
+            "appointment_id": msg.appointment_id,
+            "sender_user_id": msg.sender_user_id,
+            "body": msg.body,
+            "file_path": msg.file_path,
+            "created_at": msg.created_at,
+        },
+    }
+
+# ----------------------------------------------------------------------------- end chat
 
 # -----------------------------------------------------------------------------
 # Bootstrap admin
