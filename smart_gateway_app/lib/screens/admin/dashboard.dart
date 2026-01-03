@@ -42,7 +42,7 @@ String extractFilePath(dynamic row) {
   if (row is String) return row.trim();
 
   if (row is Map) {
-    // ✅ possible keys backend might return
+    //    possible keys backend might return
     const possibleKeys = [
       'file_path',
       'path',
@@ -57,13 +57,13 @@ String extractFilePath(dynamic row) {
       'image_url',
     ];
 
-    // ✅ check direct keys first
+    //    check direct keys first
     for (final k in possibleKeys) {
       final v = row[k];
       if (v is String && v.trim().isNotEmpty) return v.trim();
     }
 
-    // ✅ check common nested objects
+    //    check common nested objects
     const nestedObjects = ['file', 'attachment', 'document', 'report_file'];
 
     for (final nk in nestedObjects) {
@@ -164,7 +164,7 @@ Future<void> openAttachment(
 
   var p = filePathOrUrl.trim().replaceAll('\\', '/');
 
-  // ✅ If backend returns full URL, directly open it
+  //    If backend returns full URL, directly open it
   if (p.startsWith('http://') || p.startsWith('https://')) {
     final uri = Uri.parse(p);
     if (await canLaunchUrl(uri)) {
@@ -176,11 +176,11 @@ Future<void> openAttachment(
     }
   }
 
-  // ✅ otherwise treat as server file path
+  //    otherwise treat as server file path
   if (!p.startsWith('/')) p = '/$p';
 
   try {
-    // ✅ Use auth download
+    //    Use auth download
     final bytes = await Api.getBytes(p);
 
     if (bytes.isEmpty) {
@@ -188,12 +188,12 @@ Future<void> openAttachment(
       return;
     }
 
-    // ✅ detect file type
+    //    detect file type
     final lowerName = filename.toLowerCase();
     final lowerPath = p.toLowerCase();
     final isPdf = lowerName.endsWith('.pdf') || lowerPath.endsWith('.pdf');
 
-    // ✅ pdf -> share/download
+    //    pdf -> share/download
     if (isPdf) {
       await downloadBytes(
         bytes,
@@ -202,7 +202,7 @@ Future<void> openAttachment(
       return;
     }
 
-    // ✅ show image preview
+    //    show image preview
     await showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -217,7 +217,7 @@ Future<void> openAttachment(
       ),
     );
   } catch (e) {
-    // ✅ fallback try public URL
+    // fallback try public URL
     final url = Api.filePathToUrl(p);
     final uri = Uri.parse(url);
 
@@ -719,7 +719,7 @@ class _PatientRow {
   });
 }
 
-/// ───────────────────── Appointments (tap to detail) ─────────────────────
+/// ───────────────────── Appointments  ─────────────────────
 
 class _AdminAppointmentsTab extends StatefulWidget {
   const _AdminAppointmentsTab();
@@ -729,158 +729,624 @@ class _AdminAppointmentsTab extends StatefulWidget {
 }
 
 class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
-  final df = DateFormat.yMMMd().add_jm();
+  final dfFull = DateFormat.yMMMd().add_jm();
+  final dfDay = DateFormat.yMMMMd();
 
-  List<dynamic> items = [];
+  final qCtrl = TextEditingController();
   bool loading = true;
+
+  // Raw server list
+  List<Map<String, dynamic>> _all = [];
+
+  // Filtered + sorted list (paged)
+  List<Map<String, dynamic>> _view = [];
+
+  // Filters
+  String _statusFilter = 'all'; // all / requested / approved / rejected / cancelled
+  DateTimeRange? _dateRange;
+
+  // Pagination
+  int page = 1;
+  final int pageSize = 25;
+  int total = 0;
+
+  // Name caches (for search + display)
+  final Map<int, String> _doctorNameCache = {};
+  final Map<int, String> _patientNameCache = {};
 
   @override
   void initState() {
     super.initState();
     _load();
+    qCtrl.addListener(() => _apply(resetPage: true));
   }
+
+  @override
+  void dispose() {
+    qCtrl.dispose();
+    super.dispose();
+  }
+
+  // ───────────────────────── Helpers ─────────────────────────
+
+  int _apptId(Map<String, dynamic> a) {
+    final idDyn = a['id'];
+    return (idDyn is num) ? idDyn.toInt() : int.tryParse('$idDyn') ?? 0;
+  }
+
+  String _status(Map<String, dynamic> a) => (a['status'] ?? '').toString().trim();
+
+  DateTime? _parseDate(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v;
+    if (v is String) return DateTime.tryParse(v);
+    if (v is int) {
+      // support seconds or millis
+      if (v < 10000000000) return DateTime.fromMillisecondsSinceEpoch(v * 1000);
+      return DateTime.fromMillisecondsSinceEpoch(v);
+    }
+    if (v is double) {
+      final n = v.toInt();
+      if (n < 10000000000) return DateTime.fromMillisecondsSinceEpoch(n * 1000);
+      return DateTime.fromMillisecondsSinceEpoch(n);
+    }
+    return null;
+  }
+
+  DateTime? _start(Map<String, dynamic> a) => _parseDate(a['start_time']);
+  DateTime? _end(Map<String, dynamic> a) => _parseDate(a['end_time']);
+  DateTime? _created(Map<String, dynamic> a) =>
+      _parseDate(a['created_at'] ?? a['createdAt'] ?? a['created']);
+
+  int? _doctorId(Map<String, dynamic> a) {
+    final doc = a['doctor'];
+    if (doc is Map && doc['id'] is num) return (doc['id'] as num).toInt();
+    final did = a['doctor_id'] ?? a['doctorId'] ?? a['doctorID'];
+    if (did is num) return did.toInt();
+    return int.tryParse('$did');
+  }
+
+  int? _patientId(Map<String, dynamic> a) {
+    final pat = a['patient'];
+    if (pat is Map && pat['id'] is num) return (pat['id'] as num).toInt();
+    final pid = a['patient_id'] ?? a['patientId'] ?? a['patientID'];
+    if (pid is num) return pid.toInt();
+    return int.tryParse('$pid');
+  }
+
+  String _doctorName(Map<String, dynamic> a) {
+    final doc = a['doctor'];
+    if (doc is Map && doc['name'] != null) return '${doc['name']}';
+
+    final v = (a['doctor_name'] ?? a['_doctor_name'] ?? '').toString();
+    if (v.trim().isNotEmpty) return v.trim();
+
+    final id = _doctorId(a);
+    if (id != null && _doctorNameCache[id] != null) return _doctorNameCache[id]!;
+    return id != null ? 'Doctor #$id' : '';
+  }
+
+  String _patientName(Map<String, dynamic> a) {
+    final pat = a['patient'];
+    if (pat is Map && pat['name'] != null) return '${pat['name']}';
+
+    final v = (a['patient_name'] ?? a['_patient_name'] ?? '').toString();
+    if (v.trim().isNotEmpty) return v.trim();
+
+    final id = _patientId(a);
+    if (id != null && _patientNameCache[id] != null) return _patientNameCache[id]!;
+    return id != null ? 'Patient #$id' : '';
+  }
+
+  bool _isUnapprovedStatus(String s) {
+    final t = s.toLowerCase();
+    return t.contains('requested') ||
+        t.contains('pending') ||
+        t.contains('unapproved') ||
+        t.contains('waiting');
+  }
+
+  /// ✅ Sort rule:
+  /// 1) Unapproved on top
+  /// 2) If both unapproved -> earliest created_at first (who took first)
+  /// 3) Otherwise -> newest start_time first
+  int _sortCompare(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final ua = _isUnapprovedStatus(_status(a));
+    final ub = _isUnapprovedStatus(_status(b));
+
+    // 1) unapproved always on top
+    if (ua != ub) return ua ? -1 : 1;
+
+    // 2) if both unapproved -> booked first = created_at ASC
+    if (ua && ub) {
+      final ca = _created(a) ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final cb = _created(b) ?? DateTime.fromMillisecondsSinceEpoch(0);
+
+      final c = ca.compareTo(cb);
+      if (c != 0) return c;
+
+      // tie-breaker: smaller id first
+      return _apptId(a).compareTo(_apptId(b));
+    }
+
+    // 3) others -> newest first (start_time DESC)
+    final ta = _start(a) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    final tb = _start(b) ?? DateTime.fromMillisecondsSinceEpoch(0);
+
+    final t = tb.compareTo(ta);
+    if (t != 0) return t;
+
+    // fallback: newest created_at DESC
+    final ca = _created(a) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    final cb = _created(b) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    return cb.compareTo(ca);
+  }
+
+  // ───────────────────────── Load + Enrich Names ─────────────────────────
 
   Future<void> _load() async {
     setState(() => loading = true);
     try {
       final res = await Api.get('/admin/appointments');
-      items = res as List;
+      final list = (res as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      _all = list;
+
+      // important: ensure doctor/patient names exist for search + UI
+      await _enrichDoctorPatientNames(_all);
+
+      _apply(resetPage: true);
     } catch (e) {
       if (mounted) showSnack(context, 'Load failed: $e');
-      items = [];
+      _all = [];
+      _view = [];
+      total = 0;
     } finally {
       if (mounted) setState(() => loading = false);
     }
   }
 
+  Future<void> _enrichDoctorPatientNames(List<Map<String, dynamic>> rows) async {
+    final doctorIds = <int>{};
+    final patientIds = <int>{};
+
+    for (final a in rows) {
+      final did = _doctorId(a);
+      final pid = _patientId(a);
+
+      if (did != null && !_doctorNameCache.containsKey(did)) {
+        final doc = a['doctor'];
+        if (doc is Map && doc['name'] != null) {
+          _doctorNameCache[did] = '${doc['name']}';
+        } else {
+          doctorIds.add(did);
+        }
+      }
+
+      if (pid != null && !_patientNameCache.containsKey(pid)) {
+        final pat = a['patient'];
+        if (pat is Map && pat['name'] != null) {
+          _patientNameCache[pid] = '${pat['name']}';
+        } else {
+          patientIds.add(pid);
+        }
+      }
+    }
+
+    // fetch doctors
+    for (final id in doctorIds) {
+      try {
+        final r = await Api.get('/doctors/$id');
+        if (r is Map) {
+          final name = (r['name'] ?? '').toString().trim();
+          if (name.isNotEmpty) _doctorNameCache[id] = name;
+        }
+      } catch (_) {}
+    }
+
+    // fetch patients
+    for (final id in patientIds) {
+      try {
+        dynamic r;
+        try {
+          r = await Api.get('/admin/patients/$id');
+        } catch (_) {
+          r = await Api.get('/patients/$id');
+        }
+        if (r is Map) {
+          final name = (r['name'] ?? '').toString().trim();
+          if (name.isNotEmpty) _patientNameCache[id] = name;
+        }
+      } catch (_) {}
+    }
+
+    // attach normalized names so search is instant
+    for (final a in rows) {
+      a['_doctor_name'] = _doctorName(a);
+      a['_patient_name'] = _patientName(a);
+    }
+  }
+
+  // ───────────────────────── Apply search + filters + sort + pagination ─────────────────────────
+
+  void _apply({bool resetPage = false}) {
+    final q = qCtrl.text.trim().toLowerCase();
+
+    List<Map<String, dynamic>> rows = List<Map<String, dynamic>>.from(_all);
+
+    // Status filter
+    if (_statusFilter != 'all') {
+      rows = rows.where((a) => _status(a).toLowerCase() == _statusFilter).toList();
+    }
+
+    // Date filter (by start_time local date)
+    if (_dateRange != null) {
+      final from = DateTime(_dateRange!.start.year, _dateRange!.start.month, _dateRange!.start.day);
+      final to = DateTime(_dateRange!.end.year, _dateRange!.end.month, _dateRange!.end.day, 23, 59, 59);
+
+      rows = rows.where((a) {
+        final st = _start(a);
+        if (st == null) return false;
+        final local = st.toLocal();
+        return !local.isBefore(from) && !local.isAfter(to);
+      }).toList();
+    }
+
+    // Search filter (doctor/patient/id)
+    if (q.isNotEmpty) {
+      rows = rows.where((a) {
+        final id = _apptId(a).toString();
+        final d = _doctorName(a).toLowerCase();
+        final p = _patientName(a).toLowerCase();
+        return id.contains(q) || d.contains(q) || p.contains(q);
+      }).toList();
+    }
+
+    // Sort
+    rows.sort(_sortCompare);
+
+    total = rows.length;
+
+    if (resetPage) page = 1;
+
+    final pages = (total + pageSize - 1) ~/ pageSize;
+    if (page < 1) page = 1;
+    if (pages > 0 && page > pages) page = pages;
+    if (pages == 0) page = 1;
+
+    final startIndex = (page - 1) * pageSize;
+    final endIndex = (startIndex + pageSize) > rows.length ? rows.length : (startIndex + pageSize);
+
+    _view = rows.isEmpty ? [] : rows.sublist(startIndex, endIndex);
+
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _pickDateRange() async {
+    final now = DateTime.now();
+    final initial = _dateRange ??
+        DateTimeRange(
+          start: DateTime(now.year, now.month, now.day).subtract(const Duration(days: 7)),
+          end: DateTime(now.year, now.month, now.day),
+        );
+
+    final r = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(now.year + 3),
+      initialDateRange: initial,
+    );
+
+    if (r != null) {
+      setState(() => _dateRange = r);
+      _apply(resetPage: true);
+    }
+  }
+
+  void _clearAll() {
+    qCtrl.clear();
+    setState(() {
+      _statusFilter = 'all';
+      _dateRange = null;
+      page = 1;
+    });
+    _apply(resetPage: true);
+  }
+
+  List<_DayGroup> _groupByDay(List<Map<String, dynamic>> rows) {
+    final map = <DateTime, List<Map<String, dynamic>>>{};
+
+    for (final a in rows) {
+      final st = _start(a)?.toLocal();
+      if (st == null) continue;
+      final key = DateTime(st.year, st.month, st.day);
+      (map[key] ??= []).add(a);
+    }
+
+    final keys = map.keys.toList()..sort((a, b) => b.compareTo(a)); // newest day first
+
+    return keys.map((k) {
+      final list = map[k] ?? <Map<String, dynamic>>[];
+      list.sort(_sortCompare);
+      return _DayGroup(day: k, items: list);
+    }).toList();
+  }
+
+  // ───────────────────────── UI ─────────────────────────
+
   @override
   Widget build(BuildContext context) {
-    if (loading) return const Center(child: CircularProgressIndicator());
-    if (items.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: _load,
-        child: ListView(children: const [
-          SizedBox(height: 240),
-          Center(child: Text('No appointments')),
-        ]),
-      );
-    }
+    final pages = (total + pageSize - 1) ~/ pageSize;
+    final groups = _groupByDay(_view);
 
     return RefreshIndicator(
       onRefresh: _load,
-      child: ListView.builder(
-        itemCount: items.length,
-        itemBuilder: (ctx, i) {
-          final a = items[i] as Map<String, dynamic>;
-          final idDyn = a['id'];
-          final apptId =
-              (idDyn is num) ? idDyn.toInt() : int.tryParse('$idDyn') ?? 0;
-
-          final st = a['start_time'];
-          final en = a['end_time'];
-          DateTime? s, e;
-          if (st is String) s = DateTime.tryParse(st);
-          if (st is DateTime) s = st;
-          if (en is String) e = DateTime.tryParse(en);
-          if (en is DateTime) e = en;
-
-          final when = [
-            if (s != null) df.format(s.toLocal()),
-            if (e != null) '→ ${df.format(e.toLocal())}',
-          ].join(' ');
-
-          final status = (a['status'] ?? '').toString();
-          final pay = (a['payment_status'] ?? '').toString();
-
-          return InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: () {
-              if (apptId > 0) {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                      builder: (_) =>
-                          AppointmentDetailPage(apptId: apptId)),
-                );
-              }
-            },
-            child: Card(
-              margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14)),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text('Appointment #$apptId',
-                        style: const TextStyle(fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 2),
-                    Text(when.isEmpty ? '—' : when,
-                        maxLines: 2, overflow: TextOverflow.ellipsis),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _chip(status),
-                        _chip(pay, tone: 'info'),
-                        TextButton.icon(
-                          onPressed: apptId == 0
-                              ? null
-                              : () {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                        builder: (_) => AppointmentDetailPage(
-                                            apptId: apptId)),
-                                  );
-                                },
-                          icon: const Icon(Icons.open_in_new, size: 18),
-                          label: const Text('Open'),
-                        ),
-                      ],
+      child: Column(
+        children: [
+          // ONE LINE: search + status + date + clear
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 4,
+                  child: TextField(
+                    controller: qCtrl,
+                    decoration: InputDecoration(
+                      prefixIcon: const Icon(Icons.search),
+                      hintText: 'Search doctor, patient, appointment id',
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(28)),
+                      isDense: true,
+                      filled: true,
                     ),
-                  ],
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => _apply(resetPage: true),
+                  ),
                 ),
-              ),
+                const SizedBox(width: 8),
+
+                Expanded(
+                  flex: 2,
+                  child: DropdownButtonFormField<String>(
+                    value: _statusFilter,
+                    items: const [
+                      DropdownMenuItem(value: 'all', child: Text('All')),
+                      DropdownMenuItem(value: 'requested', child: Text('Requested')),
+                      DropdownMenuItem(value: 'approved', child: Text('Approved')),
+                      DropdownMenuItem(value: 'rejected', child: Text('Rejected')),
+                      DropdownMenuItem(value: 'cancelled', child: Text('Cancelled')),
+                    ],
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _statusFilter = v);
+                      _apply(resetPage: true);
+                    },
+                    decoration: const InputDecoration(
+                      labelText: 'Status',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+
+                Expanded(
+                  flex: 3,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.date_range),
+                    label: Text(
+                      _dateRange == null
+                          ? 'Date'
+                          : '${DateFormat.yMMMd().format(_dateRange!.start)} → ${DateFormat.yMMMd().format(_dateRange!.end)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    onPressed: _pickDateRange,
+                  ),
+                ),
+
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Clear filters',
+                  onPressed: _clearAll,
+                  icon: const Icon(Icons.clear_all),
+                ),
+              ],
             ),
-          );
+          ),
+
+          if (loading) const LinearProgressIndicator(),
+
+          // Grouped list
+          Expanded(
+            child: (!loading && total == 0)
+                ? ListView(
+                    children: const [
+                      SizedBox(height: 220),
+                      Center(child: Text('No appointments')),
+                    ],
+                  )
+                : ListView.builder(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                    itemCount: groups.length,
+                    itemBuilder: (ctx, idx) {
+                      final g = groups[idx];
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(6, 12, 6, 6),
+                            child: Text(
+                              dfDay.format(g.day),
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            ),
+                          ),
+                          ...g.items.map((a) => _apptCard(ctx, a)).toList(),
+                        ],
+                      );
+                    },
+                  ),
+          ),
+
+          // Pagination
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                Text(
+                  'Page $page / ${pages == 0 ? 1 : pages}',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                Text('Total: $total'),
+                const SizedBox(width: 10),
+                IconButton(
+                  tooltip: 'Prev',
+                  onPressed: (page > 1 && !loading)
+                      ? () {
+                          setState(() => page -= 1);
+                          _apply();
+                        }
+                      : null,
+                  icon: const Icon(Icons.chevron_left),
+                ),
+                IconButton(
+                  tooltip: 'Next',
+                  onPressed: (page < pages && !loading)
+                      ? () {
+                          setState(() => page += 1);
+                          _apply();
+                        }
+                      : null,
+                  icon: const Icon(Icons.chevron_right),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ───────────────────────── Card ─────────────────────────
+
+  Widget _apptCard(BuildContext ctx, Map<String, dynamic> a) {
+    final id = _apptId(a);
+
+    final st = _start(a);
+    final en = _end(a);
+
+    // keep time info (NOT visiting time). If you want remove time completely, delete this "when" block.
+    final when = [
+      if (st != null) dfFull.format(st.toLocal()),
+      if (en != null) '→ ${dfFull.format(en.toLocal())}',
+    ].join(' ');
+
+    final status = _status(a);
+    final pay = (a['payment_status'] ?? '').toString();
+
+    final doctor = _doctorName(a);
+    final patient = _patientName(a);
+
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: () {
+          if (id > 0) {
+            Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => AppointmentDetailPage(apptId: id)),
+            );
+          }
         },
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text('Appointment #$id', style: const TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 4),
+
+              // ✅ show doctor + patient name always
+              Text(
+                [
+                  if (doctor.isNotEmpty) 'Doctor: $doctor',
+                  if (patient.isNotEmpty) 'Patient: $patient',
+                ].join(' • '),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+
+              if (when.isNotEmpty) ...[
+                const SizedBox(height: 3),
+                Text(when, maxLines: 2, overflow: TextOverflow.ellipsis),
+              ],
+
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _chip(status),
+                  if (pay.isNotEmpty) _chip(pay, tone: 'info'),
+                  TextButton.icon(
+                    onPressed: id == 0
+                        ? null
+                        : () => Navigator.of(context).push(
+                              MaterialPageRoute(builder: (_) => AppointmentDetailPage(apptId: id)),
+                            ),
+                    icon: const Icon(Icons.open_in_new, size: 18),
+                    label: const Text('Open'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 
   Widget _chip(String text, {String tone = 'ok'}) {
     Color bg, fg;
+    final t = text.toLowerCase();
+
     switch (tone) {
       case 'info':
         bg = Colors.blue.withOpacity(.12);
         fg = Colors.blue.shade800;
         break;
-      case 'warn':
-        bg = Colors.amber.withOpacity(.18);
-        fg = Colors.amber.shade900;
-        break;
       default:
-        if (text.toLowerCase().contains('approved') ||
-            text.toLowerCase().contains('paid')) {
-          bg = Colors.green.withOpacity(.15);
+        if (t.contains('requested') || t.contains('pending') || t.contains('unapproved')) {
+          bg = Colors.orange.withOpacity(.16);
+          fg = Colors.orange.shade900;
+        } else if (t.contains('approved') || t.contains('paid')) {
+          bg = Colors.green.withOpacity(.16);
           fg = Colors.green.shade800;
-        } else if (text.toLowerCase().contains('pending') ||
-            text.toLowerCase().contains('requested')) {
-          bg = Colors.orange.withOpacity(.15);
-          fg = Colors.orange.shade800;
-        } else {
-          bg = Colors.red.withOpacity(.15);
+        } else if (t.contains('cancel') || t.contains('reject')) {
+          bg = Colors.red.withOpacity(.16);
           fg = Colors.red.shade800;
+        } else {
+          bg = Colors.grey.withOpacity(.18);
+          fg = Colors.grey.shade800;
         }
     }
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(24)),
-      child: Text(text, style: TextStyle(color: fg, fontWeight: FontWeight.w600)),
+      child: Text(text.isEmpty ? '—' : text, style: TextStyle(color: fg, fontWeight: FontWeight.w700)),
     );
   }
 }
+
+class _DayGroup {
+  final DateTime day;
+  final List<Map<String, dynamic>> items;
+  _DayGroup({required this.day, required this.items});
+}
+
 
 /// ─────────────────────────── Admin Profile ───────────────────────────
 
@@ -1795,10 +2261,10 @@ class _AppointmentDetailPageState extends State<AppointmentDetailPage> {
 
       // prescriptions
       try {
-        // ✅ correct backend endpoint (doctor uses this)
+        //    correct backend endpoint (doctor uses this)
         pres = await Api.get('/appointments/${widget.apptId}/prescription');
       } catch (_) {
-        // ✅ fallback: try plural (only if exists in future)
+        //    fallback: try plural (only if exists in future)
         try {
           pres = await Api.get('/appointments/${widget.apptId}/prescriptions');
         } catch (_) {
@@ -2282,7 +2748,7 @@ class _AppointmentDetailPageState extends State<AppointmentDetailPage> {
                         'file': dio_pkg.MultipartFile.fromBytes(bytes, filename: selectedFile!.name),
                       });
 
-                      // ✅ Use authenticated Api client multipart helper
+                      //    Use authenticated Api client multipart helper
                       try {
                         await Api.postMultipart('/appointments/${widget.apptId}/reports', formData: form);
                       } catch (_) {
@@ -2368,7 +2834,7 @@ if (st is DateTime) s = st;
 if (en is String) e = DateTime.tryParse(en);
 if (en is DateTime) e = en;
 
-// ✅ Doctor extraction (supports doctor, doctor_id)
+//    Doctor extraction (supports doctor, doctor_id)
 final doc = (m?['doctor'] is Map)
     ? Map<String, dynamic>.from(m?['doctor'])
     : null;

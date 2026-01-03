@@ -2596,14 +2596,13 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
 
   // reschedule state
   String visitMode = 'offline';
-  final DateFormat _dDay = DateFormat('EEE, MMM d');      // e.g. Wed, Oct 29
-  final DateFormat _dTime = DateFormat('h:mm a');         // e.g. 9:00 AM
-  final DateFormat _dIso = DateFormat('yyyy-MM-dd');      // for API day key
+  final DateFormat _dDay = DateFormat('EEE, MMM d'); // e.g. Wed, Oct 29
+  final DateFormat _dTime = DateFormat('h:mm a'); // e.g. 9:00 AM
+  final DateFormat _dIso = DateFormat('yyyy-MM-dd'); // for API day key
   DateTime monthAnchor = DateTime(DateTime.now().year, DateTime.now().month, 1);
   final Map<String, List<Map<String, dynamic>>> schedulesByDay = {};
   String? selectedDayKey;
   Map<String, dynamic>? targetBlock;
-  
 
   // rating (kept as before; hidden unless progress == completed)
   final _comment = TextEditingController();
@@ -2627,8 +2626,14 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
 
   DateTime? _findCreatedAt(Map a) {
     const keys = [
-      'created_at','createdAt','created','created_date','createdOn',
-      'inserted_at','meta.created_at','meta.createdAt'
+      'created_at',
+      'createdAt',
+      'created',
+      'created_date',
+      'createdOn',
+      'inserted_at',
+      'meta.created_at',
+      'meta.createdAt'
     ];
     for (final k in keys) {
       dynamic cur = a;
@@ -2661,9 +2666,15 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
 
   String _hospitalPhoneOf(Map a) {
     const keys = [
-      'contact_phone','hospital_phone','hospital.contact_phone',
-      'hospital.phone','hospital.phone_number','hospital_mobile',
-      'contact_number','hospital_contact'
+      'contact_phone',
+      'hospital_phone',
+      'hospital.contact_phone',
+      'hospital.phone',
+      'hospital.phone_number',
+      'hospital_mobile',
+      'contact_number',
+      'hospital_contact',
+      'contact.hospital_hotline',
     ];
     for (final k in keys) {
       final v = _getStringPath(a, k);
@@ -2674,8 +2685,12 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
 
   String _doctorPhoneOf(Map a) {
     const keys = [
-      'doctor_phone','doctor.contact_phone','doctor.phone',
-      'doctor.mobile','doctor_cell','doctor_phone_number'
+      'doctor_phone',
+      'doctor.contact_phone',
+      'doctor.phone',
+      'doctor.mobile',
+      'doctor_cell',
+      'doctor_phone_number'
     ];
     for (final k in keys) {
       final v = _getStringPath(a, k);
@@ -2684,8 +2699,33 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
     return '';
   }
 
+  String _humanTime(dynamic v) {
+    if (v == null) return '-';
+    final s = v.toString().trim();
+    if (s.isEmpty || s == 'null') return '-';
+
+    // if backend sends ISO datetime
+    try {
+      final dt = DateTime.parse(s);
+      return _dTime.format(dt); // e.g. 9:30 AM
+    } catch (_) {}
+
+    // if backend sends "HH:mm" or "HH:mm:ss"
+    try {
+      final parts = s.split(':');
+      if (parts.length >= 2) {
+        final h = int.parse(parts[0]);
+        final m = int.parse(parts[1]);
+        final fake = DateTime(2000, 1, 1, h, m);
+        return _dTime.format(fake); // e.g. 9:30 AM
+      }
+    } catch (_) {}
+
+    return s; // fallback: show raw
+  }
+
   num? _paymentAmountOf(Map a) {
-    const keys = ['amount','payment_amount','fee','fees','total','price','payable'];
+    const keys = ['amount', 'payment_amount', 'fee', 'fees', 'total', 'price', 'payable'];
     for (final k in keys) {
       final v = a[k];
       if (v == null) continue;
@@ -2751,34 +2791,36 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
     visitMode = (appt!['visit_mode'] ?? 'offline').toString().toLowerCase();
 
     // enrich doctor (optional)
-try {
-  final id = (appt!['doctor_id'] as num?)?.toInt();
-  if (id != null) {
-    final dj = await Api.get('/doctors/$id') as Map;
-    final d  = Doctor.fromJson(dj.cast<String, dynamic>());
+    try {
+      final id = (appt!['doctor_id'] as num?)?.toInt();
+      if (id != null) {
+        final dj = await Api.get('/doctors/$id') as Map;
+        final d = Doctor.fromJson(dj.cast<String, dynamic>());
 
-    appt!['doctor_name']         ??= d.name;
-    appt!['doctor_photo_path']    = d.photoPath;
+        appt!['doctor_name'] ??= d.name;
+        appt!['doctor_photo_path'] = d.photoPath;
 
-    // NEW: try multiple keys for phone/address/fee to be robust
-    appt!['doctor_phone']         ??= (dj['phone'] ?? dj['contact_phone'] ?? dj['mobile'] ?? dj['contact_number'])?.toString();
-    appt!['doctor_address']       ??= (dj['address'] ?? dj['location'] ?? dj['clinic_address'] ?? dj['hospital_address'])?.toString();
+        // NEW: try multiple keys for phone/address/fee to be robust
+        appt!['doctor_phone'] ??=
+            (dj['phone'] ?? dj['contact_phone'] ?? dj['mobile'] ?? dj['contact_number'])?.toString();
+        appt!['doctor_address'] ??=
+            (dj['address'] ?? dj['location'] ?? dj['clinic_address'] ?? dj['hospital_address'])?.toString();
 
-    // Visiting fee normalizer
-    num? _fx(dynamic v) {
-      if (v == null) return null;
-      if (v is num) return v;
-      return num.tryParse(v.toString().replaceAll(RegExp(r'[^0-9.\-]'), ''));
-    }
-    appt!['doctor_visiting_fee'] ??=
-        _fx(dj['visiting_fee']) ??
-        _fx(dj['visit_fee']) ??
-        _fx(dj['fee']) ??
-        _fx(dj['fees']) ??
-        _fx(dj['amount']) ??
-        _fx(dj['price']);
-  }
-} catch (_) {}
+        // Visiting fee normalizer
+        num? _fx(dynamic v) {
+          if (v == null) return null;
+          if (v is num) return v;
+          return num.tryParse(v.toString().replaceAll(RegExp(r'[^0-9.\-]'), ''));
+        }
+
+        appt!['doctor_visiting_fee'] ??= _fx(dj['visiting_fee']) ??
+            _fx(dj['visit_fee']) ??
+            _fx(dj['fee']) ??
+            _fx(dj['fees']) ??
+            _fx(dj['amount']) ??
+            _fx(dj['price']);
+      }
+    } catch (_) {}
 
     // reports (scoped)
     try {
@@ -2800,19 +2842,27 @@ try {
         '/api/prescriptions?appointment_id=${widget.apptId}',
       ];
       for (final u in urls) {
-        try { rx = await Api.get(u); if (rx != null) break; } catch (_) {}
+        try {
+          rx = await Api.get(u);
+          if (rx != null) break;
+        } catch (_) {}
       }
       if (rx == null) {
         final fromAppt = appt?['prescriptions'] ?? appt?['prescription'];
         if (fromAppt != null) rx = fromAppt;
       }
       if (rx is List) {
-        prescriptions = rx.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e as Map)).toList();
+        prescriptions =
+            rx.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e as Map)).toList();
       } else if (rx is Map) {
         if (rx['items'] is List) {
-          prescriptions = (rx['items'] as List).map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e as Map)).toList();
+          prescriptions = (rx['items'] as List)
+              .map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
         } else if (rx['data'] is List) {
-          prescriptions = (rx['data'] as List).map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e as Map)).toList();
+          prescriptions = (rx['data'] as List)
+              .map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
         } else if (rx.isNotEmpty) {
           prescriptions = [Map<String, dynamic>.from(rx)];
         } else {
@@ -2850,8 +2900,9 @@ try {
   bool get _isOnline => _visit == 'online';
 
   bool get _canUploadReports => (_progress == 'in_progress' || _progress == 'hold');
-  bool get _canReschedule => _progress == 'not_yet' && !{'cancelled','rejected'}.contains(_status);
-  bool get _canCancel => _progress == 'not_yet' && !{'cancelled','rejected','completed'}.contains(_status);
+  bool get _canReschedule => _progress == 'not_yet' && !{'cancelled', 'rejected'}.contains(_status);
+  bool get _canCancel =>
+      _progress == 'not_yet' && !{'cancelled', 'rejected', 'completed'}.contains(_status);
   bool get _canRate => _progress == 'completed';
 
   bool get _paid => (appt?['payment_status'] ?? '').toString() == 'paid';
@@ -2862,26 +2913,14 @@ try {
 
   bool get _canDeleteAppt {
     final norm = _status.trim().toLowerCase().replaceAll(' ', '_').replaceAll('-', '_');
-    const deletable = {'cancelled','rejected','no_show','not_show','not_showed','noshow'};
+    const deletable = {'cancelled', 'rejected', 'no_show', 'not_show', 'not_showed', 'noshow'};
     return deletable.contains(norm);
-  }
-
-  bool _videoWindowNow() {
-    try {
-      final s = DateTime.parse(appt!['start_time'].toString());
-      final e = DateTime.parse(appt!['end_time'].toString());
-      final now = DateTime.now();
-      return now.isAfter(s.subtract(const Duration(minutes: 10))) &&
-             now.isBefore(e.add(const Duration(minutes: 30)));
-    } catch (_) {
-      return false;
-    }
   }
 
   //bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _videoWindowNow();
   //bool get _canChat  => _isOnline && (_progress == 'in_progress' || _progress == 'hold') && _paid && _status == 'approved';
   bool get _canVideo => _isOnline && (_progress == 'in_progress' || _progress == 'hold');
-  bool get _canChat  => _isOnline && (_progress == 'in_progress' || _progress == 'hold');
+  bool get _canChat => _isOnline && (_progress == 'in_progress' || _progress == 'hold');
 
   // ---------------- actions ----------------
   Future<bool> _confirm({
@@ -2947,11 +2986,11 @@ try {
     final tries = <Future<dynamic> Function()>[
       () => Api.delete('/appointments/$id'),
       () => Api.delete('/appointment/$id'),
-      () => Api.post  ('/appointments/$id/delete'),
-      () => Api.post  ('/appointment/$id/delete'),
-      () => Api.patch ('/appointments/$id', data: {'deleted': true}),
+      () => Api.post('/appointments/$id/delete'),
+      () => Api.post('/appointment/$id/delete'),
+      () => Api.patch('/appointments/$id', data: {'deleted': true}),
       () => Api.delete('/me/appointments/$id'),
-      () => Api.post  ('/me/appointments/$id/delete'),
+      () => Api.post('/me/appointments/$id/delete'),
     ];
 
     dynamic lastErr;
@@ -2970,7 +3009,8 @@ try {
 
   Future<void> _rateSubmit() async {
     try {
-      await Api.post('/appointments/${widget.apptId}/rate', data: {'stars': _stars, 'comment': _comment.text});
+      await Api.post('/appointments/${widget.apptId}/rate',
+          data: {'stars': _stars, 'comment': _comment.text});
       _existingRating = {'stars': _stars, 'comment': _comment.text};
       showSnack(context, 'Thanks for your feedback!');
       setState(() {});
@@ -2987,7 +3027,7 @@ try {
     String hhmm(String hm) => hm.padLeft(5, '0');
     final body = {
       'new_start_time': '${selectedDayKey!}T${hhmm((targetBlock!['start'] ?? '').toString())}:00',
-      'new_end_time':   '${selectedDayKey!}T${hhmm((targetBlock!['end'] ?? '').toString())}:00',
+      'new_end_time': '${selectedDayKey!}T${hhmm((targetBlock!['end'] ?? '').toString())}:00',
     };
     try {
       await Api.patch('/appointments/${widget.apptId}/reschedule', data: body);
@@ -2998,83 +3038,96 @@ try {
     }
   }
 
+  Future<void> _downloadFile(String url, String suggested) async {
+    try {
+      String? _fromContentDisposition(String? cd) {
+        if (cd == null) return null;
+        final mStar = RegExp(r'''filename\*\s*=\s*[^']*''([^;]+)''''', caseSensitive: false)
+            .firstMatch(cd);
+        if (mStar != null) {
+          return Uri.decodeFull(mStar.group(1)!.trim());
+        }
+        final mQuoted = RegExp(r'''filename\s*=\s*"([^"]+)"''', caseSensitive: false).firstMatch(cd);
+        if (mQuoted != null) {
+          return mQuoted.group(1)!.trim();
+        }
+        final mBare = RegExp(r'''filename\s*=\s*([^;]+)''', caseSensitive: false).firstMatch(cd);
+        if (mBare != null) {
+          return mBare.group(1)!.trim();
+        }
+        return null;
+      }
 
+      String _extFromMime(String? mime) {
+        switch ((mime ?? '').toLowerCase()) {
+          case 'application/pdf':
+            return '.pdf';
+          case 'image/png':
+            return '.png';
+          case 'image/jpeg':
+          case 'image/jpg':
+            return '.jpg';
+          case 'image/webp':
+            return '.webp';
+          case 'text/plain':
+            return '.txt';
+          default:
+            return '';
+        }
+      }
 
-Future<void> _downloadFile(String url, String suggested) async {
-  try {
-    String? _fromContentDisposition(String? cd) {
-      if (cd == null) return null;
-      final mStar = RegExp(r'''filename\*\s*=\s*[^']*''([^;]+)''''', caseSensitive: false).firstMatch(cd);
-      if (mStar != null) {
-        return Uri.decodeFull(mStar.group(1)!.trim());
+      String _ensureExt(String name, {String? urlPath, String? mime}) {
+        final hasExt = name.contains('.') && !name.endsWith('.');
+        if (hasExt) return name;
+        final segs = (urlPath ?? '').split('/').where((s) => s.isNotEmpty).toList();
+        final last = segs.isNotEmpty ? segs.last : '';
+        if (last.contains('.')) {
+          final ext = last.substring(last.lastIndexOf('.'));
+          return name.isEmpty ? last : name + ext;
+        }
+        final guess = _extFromMime(mime);
+        if (guess.isNotEmpty) return name.isEmpty ? 'document' + guess : name + guess;
+        return name.isEmpty ? 'document.pdf' : name + '.pdf';
       }
-      final mQuoted = RegExp(r'''filename\s*=\s*"([^"]+)"''', caseSensitive: false).firstMatch(cd);
-      if (mQuoted != null) {
-        return mQuoted.group(1)!.trim();
+
+      final isAbsolute = url.startsWith('http://') || url.startsWith('https://');
+      final requestUri = isAbsolute ? Uri.parse(url) : Uri.parse('${Api.baseUrl}$url');
+      final dio = Dio();
+      final res = await dio.getUri<List<int>>(
+        requestUri,
+        options: Options(
+          responseType: ResponseType.bytes,
+          followRedirects: true,
+          validateStatus: (_) => true,
+        ),
+      );
+
+      if (res.statusCode != null &&
+          res.statusCode! >= 200 &&
+          res.statusCode! < 300 &&
+          res.data != null) {
+        final cd = res.headers.value('content-disposition');
+        final ctype = res.headers.value('content-type');
+        final fromCd = _fromContentDisposition(cd);
+        String name = (fromCd ?? suggested).trim();
+        name = _ensureExt(name, urlPath: requestUri.path, mime: ctype);
+        final bytes = Uint8List.fromList(res.data!);
+        await downloadBytes(bytes, name);
+      } else {
+        await openUrlExternal(url);
       }
-      final mBare = RegExp(r'''filename\s*=\s*([^;]+)''', caseSensitive: false).firstMatch(cd);
-      if (mBare != null) {
-        return mBare.group(1)!.trim();
-      }
-      return null;
+    } catch (e) {
+      showSnack(context, 'Download failed: $e');
     }
-
-    String _extFromMime(String? mime) {
-      switch ((mime ?? '').toLowerCase()) {
-        case 'application/pdf': return '.pdf';
-        case 'image/png': return '.png';
-        case 'image/jpeg':
-        case 'image/jpg': return '.jpg';
-        case 'image/webp': return '.webp';
-        case 'text/plain': return '.txt';
-        default: return '';
-      }
-    }
-
-    String _ensureExt(String name, {String? urlPath, String? mime}) {
-      final hasExt = name.contains('.') && !name.endsWith('.');
-      if (hasExt) return name;
-      final segs = (urlPath ?? '').split('/').where((s) => s.isNotEmpty).toList();
-      final last = segs.isNotEmpty ? segs.last : '';
-      if (last.contains('.')) {
-        final ext = last.substring(last.lastIndexOf('.'));
-        return name.isEmpty ? last : name + ext;
-      }
-      final guess = _extFromMime(mime);
-      if (guess.isNotEmpty) return name.isEmpty ? 'document' + guess : name + guess;
-      return name.isEmpty ? 'document.pdf' : name + '.pdf';
-    }
-
-    final isAbsolute = url.startsWith('http://') || url.startsWith('https://');
-    final requestUri = isAbsolute ? Uri.parse(url) : Uri.parse('${Api.baseUrl}$url');
-    final dio = Dio();
-    final res = await dio.getUri<List<int>>(
-      requestUri,
-      options: Options(responseType: ResponseType.bytes, followRedirects: true, validateStatus: (_) => true),
-    );
-
-    if (res.statusCode != null && res.statusCode! >= 200 && res.statusCode! < 300 && res.data != null) {
-      final cd = res.headers.value('content-disposition');
-      final ctype = res.headers.value('content-type');
-      final fromCd = _fromContentDisposition(cd);
-      String name = (fromCd ?? suggested).trim();
-      name = _ensureExt(name, urlPath: requestUri.path, mime: ctype);
-      final bytes = Uint8List.fromList(res.data!);
-      await downloadBytes(bytes, name);
-    } else {
-      await openUrlExternal(url);
-    }
-  } catch (e) {
-    showSnack(context, 'Download failed: $e');
   }
-}
 
   Future<void> _uploadReport() async {
     if (!_canUploadReports) return;
     final pick = await FilePicker.platform.pickFiles(withData: true);
     if (pick == null || pick.files.isEmpty) return;
     final f = pick.files.first;
-    final form = FormData.fromMap({'file': MultipartFile.fromBytes(f.bytes as Uint8List, filename: f.name)});
+    final form =
+        FormData.fromMap({'file': MultipartFile.fromBytes(f.bytes as Uint8List, filename: f.name)});
     try {
       await Api.post('/appointments/${widget.apptId}/reports', data: form, multipart: true);
       showSnack(context, 'Uploaded ${f.name}');
@@ -3082,7 +3135,8 @@ Future<void> _downloadFile(String url, String suggested) async {
     } catch (e) {
       // singular fallback
       try {
-        final form2 = FormData.fromMap({'file': MultipartFile.fromBytes(f.bytes as Uint8List, filename: f.name)});
+        final form2 = FormData.fromMap(
+            {'file': MultipartFile.fromBytes(f.bytes as Uint8List, filename: f.name)});
         await Api.post('/appointments/${widget.apptId}/report', data: form2, multipart: true);
         showSnack(context, 'Uploaded ${f.name}');
         await _loadAll();
@@ -3105,15 +3159,15 @@ Future<void> _downloadFile(String url, String suggested) async {
     final tries = <Future<dynamic> Function()>[
       () => Api.delete('/appointments/$apptId/reports/$id'),
       () => Api.delete('/appointments/$apptId/report/$id'),
-      () => Api.post  ('/appointments/$apptId/reports/$id/delete'),
-      () => Api.post  ('/appointments/$apptId/report/$id/delete'),
-      () => Api.patch ('/appointments/$apptId/report/$id', data: {'deleted': true}),
+      () => Api.post('/appointments/$apptId/reports/$id/delete'),
+      () => Api.post('/appointments/$apptId/report/$id/delete'),
+      () => Api.patch('/appointments/$apptId/report/$id', data: {'deleted': true}),
       // global fallbacks
       () => Api.delete('/reports/$id'),
       () => Api.delete('/report/$id'),
-      () => Api.post  ('/reports/$id/delete'),
-      () => Api.post  ('/report/$id/delete'),
-      () => Api.patch ('/report/$id', data: {'deleted': true}),
+      () => Api.post('/reports/$id/delete'),
+      () => Api.post('/report/$id/delete'),
+      () => Api.patch('/report/$id', data: {'deleted': true}),
     ];
 
     dynamic lastErr;
@@ -3139,7 +3193,8 @@ Future<void> _downloadFile(String url, String suggested) async {
     String? tmpSelected;
 
     final days = _daysInMonth(useAnchor);
-    final todayMidnight = DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day);
+    final todayMidnight =
+        DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day);
     final int doctorId = (appt?['doctor_id'] as num?)?.toInt() ?? 0;
     if (doctorId == 0) return;
 
@@ -3159,7 +3214,8 @@ Future<void> _downloadFile(String url, String suggested) async {
       required String start,
       required String end,
       required int remaining,
-    }) => {'id': id ?? '${start}_$end', 'start': start, 'end': end, 'remaining': remaining};
+    }) =>
+        {'id': id ?? '${start}_$end', 'start': start, 'end': end, 'remaining': remaining};
 
     for (int day = 1; day <= days; day++) {
       final d = DateTime(useAnchor.year, useAnchor.month, day);
@@ -3187,8 +3243,8 @@ Future<void> _downloadFile(String url, String suggested) async {
             if ((r['date'] ?? '').toString() != key) continue;
             final modeStr = (r['mode'] ?? r['visit_mode'] ?? '').toString().toLowerCase();
             if (useMode.isNotEmpty && modeStr.isNotEmpty && modeStr != useMode) continue;
-            final sStart = _extractHm(r, ['start','time_from','start_time','from','schedule_time_from']);
-            final sEnd   = _extractHm(r, ['end','time_to','end_time','to','schedule_time_to']);
+            final sStart = _extractHm(r, ['start', 'time_from', 'start_time', 'from', 'schedule_time_from']);
+            final sEnd = _extractHm(r, ['end', 'time_to', 'end_time', 'to', 'schedule_time_to']);
             if (sStart.isEmpty || sEnd.isEmpty) continue;
             final mp = r['max_patients'];
             final cap = mp is num ? mp.toInt() : int.tryParse('$mp') ?? 1;
@@ -3200,10 +3256,16 @@ Future<void> _downloadFile(String url, String suggested) async {
             final b = (b0 as Map).cast<String, dynamic>();
             final modeStr = (b['mode'] ?? b['visit_mode'] ?? '').toString().toLowerCase();
             if (modeStr.isNotEmpty && modeStr != useMode) continue;
-            final rem = (b['remaining'] ?? b['available'] ?? b['available_seats'] ?? b['max_patients'] ?? 1);
+            final rem = (b['remaining'] ??
+                b['available'] ??
+                b['available_seats'] ??
+                b['max_patients'] ??
+                1);
             final remaining = rem is num ? rem.toInt() : int.tryParse(rem.toString()) ?? 1;
-            final sStart = _extractHm(b, ['start','time_from','start_time','from','schedule_time_from','slot_start']);
-            final sEnd   = _extractHm(b, ['end','time_to','end_time','to','schedule_time_to','slot_end']);
+            final sStart =
+                _extractHm(b, ['start', 'time_from', 'start_time', 'from', 'schedule_time_from', 'slot_start']);
+            final sEnd =
+                _extractHm(b, ['end', 'time_to', 'end_time', 'to', 'schedule_time_to', 'slot_end']);
             if (sStart.isNotEmpty && sEnd.isNotEmpty) {
               blocks.add(mk(id: b['id'], start: sStart, end: sEnd, remaining: remaining <= 0 ? 0 : remaining));
             }
@@ -3215,8 +3277,10 @@ Future<void> _downloadFile(String url, String suggested) async {
             if (modeStr.isNotEmpty && modeStr != useMode) continue;
             final rem = w['available'] ?? w['available_seats'] ?? 1;
             final remaining = rem is num ? rem.toInt() : int.tryParse('$rem') ?? 1;
-            final sStart = _extractHm(w, ['start','time_from','start_time','from','schedule_time_from','slot_start']);
-            final sEnd   = _extractHm(w, ['end','time_to','end_time','to','schedule_time_to','slot_end']);
+            final sStart =
+                _extractHm(w, ['start', 'time_from', 'start_time', 'from', 'schedule_time_from', 'slot_start']);
+            final sEnd =
+                _extractHm(w, ['end', 'time_to', 'end_time', 'to', 'schedule_time_to', 'slot_end']);
             if (sStart.isNotEmpty && sEnd.isNotEmpty) {
               blocks.add(mk(id: w['id'], start: sStart, end: sEnd, remaining: remaining <= 0 ? 0 : remaining));
             }
@@ -3239,8 +3303,8 @@ Future<void> _downloadFile(String url, String suggested) async {
           if (modeStr.isNotEmpty && modeStr != useMode) continue;
           final rem = b['remaining'] ?? b['available'] ?? b['available_seats'] ?? b['max_patients'] ?? 1;
           final remaining = rem is num ? rem.toInt() : int.tryParse('$rem') ?? 1;
-          final sStart = _extractHm(b, ['start','time_from','start_time','from','schedule_time_from','slot_start']);
-          final sEnd   = _extractHm(b, ['end','time_to','end_time','to','schedule_time_to','slot_end']);
+          final sStart = _extractHm(b, ['start', 'time_from', 'start_time', 'from', 'schedule_time_from', 'slot_start']);
+          final sEnd = _extractHm(b, ['end', 'time_to', 'end_time', 'to', 'schedule_time_to', 'slot_end']);
           if (sStart.isNotEmpty && sEnd.isNotEmpty) {
             blocks.add(mk(id: b['id'], start: sStart, end: sEnd, remaining: remaining <= 0 ? 0 : remaining));
           }
@@ -3273,11 +3337,36 @@ Future<void> _downloadFile(String url, String suggested) async {
     }
 
     final start = DateTime.parse(appt!['start_time'].toString());
-    final end   = DateTime.parse(appt!['end_time'].toString());
+    final end = DateTime.parse(appt!['end_time'].toString());
     final idStr = (appt!['id'] ?? widget.apptId).toString();
-    final serial = (appt!['serial'] ?? '').toString();
+    final serial = (appt?['serial_number'] ?? appt?['serial'] ?? '').toString();
+    final etaRaw = appt?['estimated_visit_time'];
+    final etaText = _humanTime(etaRaw);
+
     final createdAt = _findCreatedAt(appt!);
-    final amount = _paymentAmountOf(appt ?? const {});
+
+    //     keep amount for header card
+    final num? amount = _paymentAmountOf(appt ?? const {});
+
+    //     Visiting fee
+    final num visitingFee = (() {
+      final v = appt?['doctor_visiting_fee'];
+      if (v == null) return 0;
+      if (v is num) return v;
+      return num.tryParse(v.toString().replaceAll(RegExp(r'[^0-9.\-]'), '')) ?? 0;
+    })();
+
+    //     totalPaid
+    final num totalPaid = (appt?['payments']?['total'] is num)
+        ? appt!['payments']['total']
+        : num.tryParse('${appt?['payments']?['total'] ?? 0}') ?? 0;
+
+    //     payable = visitingFee if exists else amount
+    final num payable = (visitingFee > 0) ? visitingFee : (amount ?? 0);
+
+    //     due = payable - totalPaid
+    final num dueAmount = (payable - totalPaid) < 0 ? 0 : (payable - totalPaid);
+
     final visit = _visit;
 
     final doctorName = (appt!['doctor_name'] ?? 'Doctor').toString();
@@ -3286,27 +3375,27 @@ Future<void> _downloadFile(String url, String suggested) async {
 
     final videoUrl = (appt!['video_room'] ?? '').toString();
 
-String phoneHospital = _hospitalPhoneOf(appt!);
-String phoneDoctor   = _doctorPhoneOf(appt!);
+    String phoneHospital = _hospitalPhoneOf(appt!);
+    String phoneDoctor = _doctorPhoneOf(appt!);
 
-// fallback from embedded doctor map
-try {
-  final d = appt!['doctor'] as Map?;
-  if ((phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) && d != null) {
-    phoneDoctor = _getStringPath(d.cast<String, dynamic>(), 'phone') ??
-                  _getStringPath(d.cast<String, dynamic>(), 'mobile') ??
-                  '';
-  }
-} catch (_) {}
+    // fallback from embedded doctor map
+    try {
+      final d = appt!['doctor'] as Map?;
+      if ((phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) && d != null) {
+        phoneDoctor =
+            _getStringPath(d.cast<String, dynamic>(), 'phone') ??
+                _getStringPath(d.cast<String, dynamic>(), 'mobile') ??
+                '';
+      }
+    } catch (_) {}
 
-// fallback from enriched fields
-if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
-  phoneDoctor = (appt!['doctor_phone'] ?? '').toString();
-}
+    // fallback from enriched fields
+    if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
+      phoneDoctor = (appt!['doctor_phone'] ?? '').toString();
+    }
 
-    final VoidCallback? goToDoc = (doctorId == null)
-        ? null
-        : () => Navigator.of(context).push(
+    final VoidCallback? goToDoc =
+        (doctorId == null) ? null : () => Navigator.of(context).push(
               MaterialPageRoute(builder: (_) => _DoctorProfile(doctorId: doctorId)),
             );
 
@@ -3336,33 +3425,36 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                 visit: visit,
                 apptIdStr: idStr,
                 serial: serial,
+                estDt: etaText,
                 createdAt: createdAt,
-                amount: amount,
+                amount: payable, //     show payable here
+                totalPaid: totalPaid,
+                dueAmount: dueAmount,
                 doctorName: doctorName,
                 doctorPhotoUrl: doctorPhotoUrl,
                 onTapDoctor: goToDoc,
               ),
 
-               const SizedBox(height: 8),
-
+              const SizedBox(height: 8),
+              _paymentNoteCard(
+                visitMode: visit,
+                visitingFee: visitingFee,
+              ),
+              const SizedBox(height: 8),
               // Clinic & Contact Info + online actions (no duplicated phone below)
               Builder(
                 builder: (context) {
-                  // Derive robust doctor info from the enriched appt map
-                  final String doctorAddress =
-                      (appt!['doctor_address'] ?? '').toString().trim();
+                  final String doctorAddress = (appt!['doctor_address'] ?? '').toString().trim();
 
-                  final num? visitingFee = (() {
+                  final num? visitingFeeCard = (() {
                     final v = appt!['doctor_visiting_fee'];
                     if (v == null) return null;
                     if (v is num) return v;
-                    return num.tryParse(
-                      v.toString().replaceAll(RegExp(r'[^0-9.\-]'), ''),
-                    );
+                    return num.tryParse(v.toString().replaceAll(RegExp(r'[^0-9.\-]'), ''));
                   })();
 
                   final bool showClinic =
-                      doctorAddress.isNotEmpty || visitingFee != null || phoneDoctor.isNotEmpty;
+                      doctorAddress.isNotEmpty || visitingFeeCard != null || phoneDoctor.isNotEmpty;
 
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3377,9 +3469,11 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Row(children: [
-                                  Icon(Icons.local_hospital, color: Theme.of(context).colorScheme.primary),
+                                  Icon(Icons.local_hospital,
+                                      color: Theme.of(context).colorScheme.primary),
                                   const SizedBox(width: 8),
-                                  Text('Clinic & Contact Info', style: Theme.of(context).textTheme.titleMedium),
+                                  Text('Clinic & Contact Info',
+                                      style: Theme.of(context).textTheme.titleMedium),
                                 ]),
                                 const SizedBox(height: 8),
 
@@ -3391,13 +3485,14 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                                     title: Text(doctorAddress),
                                   ),
 
-                                if (visitingFee != null) ...[
+                                if (visitingFeeCard != null) ...[
                                   const SizedBox(height: 2),
                                   ListTile(
                                     dense: true,
                                     contentPadding: EdgeInsets.zero,
                                     leading: const Icon(Icons.payments_outlined),
-                                    title: Text('Visiting fee: ${NumberFormat.currency(symbol: '').format(visitingFee)}'),
+                                    title: Text(
+                                        'Visiting fee: ${NumberFormat.currency(symbol: '').format(visitingFeeCard)}'),
                                   ),
                                 ],
 
@@ -3408,15 +3503,25 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                                     contentPadding: EdgeInsets.zero,
                                     leading: const Icon(Icons.phone_outlined),
                                     title: Text(phoneDoctor),
-                                    trailing: IconButton(
-                                      tooltip: 'Call',
-                                      onPressed: () async {
-                                        final uri = Uri.parse('tel:$phoneDoctor');
-                                        if (await canLaunchUrl(uri)) {
-                                          await launchUrl(uri);
-                                        }
-                                      },
-                                      icon: const Icon(Icons.phone),
+                                    trailing: Wrap(
+                                      spacing: 4,
+                                      children: [
+                                        IconButton(
+                                          tooltip: 'Copy',
+                                          onPressed: () async {
+                                            await Clipboard.setData(
+                                                ClipboardData(text: phoneDoctor));
+                                            showSnack(context, 'Copied');
+                                          },
+                                          icon: const Icon(Icons.copy),
+                                        ),
+                                        IconButton(
+                                          tooltip: 'Call',
+                                          onPressed: () =>
+                                              launchUrl(Uri.parse('tel:$phoneDoctor')),
+                                          icon: const Icon(Icons.phone),
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 ],
@@ -3425,47 +3530,45 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                           ),
                         ),
                       ],
-                // Online-only live actions
-                _isOnline
-                    ? Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          FilledButton.icon(
-                            onPressed: _canVideo
-                                ? () => Navigator.of(context).push(
-                                      MaterialPageRoute(
-                                        builder: (_) =>
-                                            VideoScreen(
-                                          appointmentId: widget.apptId,
-                                          isDoctor: false,
-                                        )
-                                      ),
-                                    )
-                                : null,
-                            icon: const Icon(Icons.videocam),
-                            label: const Text('Video'),
-                          ),
-                          FilledButton.tonalIcon(
-                            onPressed: _canChat
-                                ? () => Navigator.of(context).push(
-                                      MaterialPageRoute(
-                                        builder: (_) => ChatScreen(apptId: widget.apptId),
-                                      ),
-                                    )
-                                : null,
-                            icon: const Icon(Icons.chat_bubble_outline),
-                            label: const Text('Chat'),
-                          ),
-                        ],
-                      )
-                    : const SizedBox.shrink(),
 
+                      // Online-only live actions
+                      _isOnline
+                          ? Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                FilledButton.icon(
+                                  onPressed: _canVideo
+                                      ? () => Navigator.of(context).push(
+                                            MaterialPageRoute(
+                                              builder: (_) => VideoScreen(
+                                                appointmentId: widget.apptId,
+                                                isDoctor: false,
+                                              ),
+                                            ),
+                                          )
+                                      : null,
+                                  icon: const Icon(Icons.videocam),
+                                  label: const Text('Video'),
+                                ),
+                                FilledButton.tonalIcon(
+                                  onPressed: _canChat
+                                      ? () => Navigator.of(context).push(
+                                            MaterialPageRoute(
+                                              builder: (_) => ChatScreen(apptId: widget.apptId),
+                                            ),
+                                          )
+                                      : null,
+                                  icon: const Icon(Icons.chat_bubble_outline),
+                                  label: const Text('Chat'),
+                                ),
+                              ],
+                            )
+                          : const SizedBox.shrink(),
                     ],
                   );
                 },
               ),
-
 
               // Core actions row
               Wrap(
@@ -3508,21 +3611,18 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                     label: const Text('Change schedule'),
                   ),
                   FilledButton.icon(
-                    onPressed: _canPay
-                        ? () => Navigator.of(context).push(
-                              MaterialPageRoute(builder: (_) => PaymentScreen(appointmentId: widget.apptId)),
-                            )
-                        : null,
-                    icon: const Icon(Icons.payment),
-                    label: const Text('Payment'),
+                    onPressed: () {
+                      Navigator.of(context)
+                          .push(MaterialPageRoute(
+                            builder: (_) => PaymentScreen(appointmentId: widget.apptId),
+                          ))
+                          .then((_) => setState(() {}));
+                    },
+                    icon: const Icon(Icons.payment_outlined),
+                    label: const Text('Make Payment'),
                   ),
                 ],
               ),
-
-              const SizedBox(height: 8),
-              if (phoneHospital.isNotEmpty || phoneDoctor.isNotEmpty)
-                _contactsCard(phoneHospital, ''),
-
 
               const Divider(height: 24),
 
@@ -3531,12 +3631,11 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
                 title: 'Prescriptions (this appointment)',
                 emptyText: 'No prescriptions yet.',
                 items: prescriptions,
-                // NO upload button for prescriptions; hide trailing controls; hide download if no url
                 buildHeaderTrailing: () => const SizedBox.shrink(),
                 icon: Icons.description_outlined,
                 titleOf: (m) => (m['title'] ?? 'Prescription').toString(),
                 urlOf: _anyUrl,
-                idOf: (_) => null, // no delete
+                idOf: (_) => null,
                 trailingBuilder: (url, id, title) => url == null
                     ? null
                     : IconButton(
@@ -3585,7 +3684,6 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
               ),
 
               const Divider(height: 24),
-
               if (_canRate) _ratingCard(context),
             ],
           );
@@ -3596,30 +3694,51 @@ if (phoneDoctor.isEmpty || phoneDoctor.trim().isEmpty) {
 
   // ======= UI pieces =======
 
-Widget _compactHeaderCard({
-  required bool isPhone,
-  required DateTime start,
-  required DateTime end,
-  required String visit,
-  required String apptIdStr,
-  required String serial,
-  required DateTime? createdAt,
-  required num? amount,
-  required String doctorName,
-  required String? doctorPhotoUrl,
-  required VoidCallback? onTapDoctor,
-}) {
+  Widget _compactHeaderCard({
+    required bool isPhone,
+    required DateTime start,
+    required DateTime end,
+    required String visit,
+    required String apptIdStr,
+    required String serial,
+    required String estDt,
+    required DateTime? createdAt,
+
+    //     now these come from build() (so no redeclare issues)
+    required num amount,
+    required num totalPaid,
+    required num dueAmount,
+
+    required String doctorName,
+    required String? doctorPhotoUrl,
+    required VoidCallback? onTapDoctor,
+  }) {
     final cs = Theme.of(context).colorScheme;
 
     String lineDate() => '${_dDay.format(start)} • ${_dTime.format(start)} – ${_dTime.format(end)}';
 
     Widget keyVal(IconData ic, String v) => Row(
-      children: [
-        Icon(ic, size: 16, color: cs.primary),
-        const SizedBox(width: 6),
-        Expanded(child: Text(v, maxLines: 1, overflow: TextOverflow.ellipsis)),
-      ],
-    );
+          children: [
+            Icon(ic, size: 16, color: cs.primary),
+            const SizedBox(width: 6),
+            Expanded(child: Text(v, maxLines: 1, overflow: TextOverflow.ellipsis)),
+          ],
+        );
+
+    Widget keyValBold(IconData ic, String v) => Row(
+          children: [
+            Icon(ic, size: 16, color: cs.primary),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                v,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        );
 
     return Card(
       elevation: 2,
@@ -3642,13 +3761,13 @@ Widget _compactHeaderCard({
                 ),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: cs.primaryContainer, borderRadius: BorderRadius.circular(20)),
+                  decoration: BoxDecoration(color: cs.primaryContainer, borderRadius: BorderRadius.circular(20)),
                   child: Text(visit.toUpperCase(), style: TextStyle(color: cs.onPrimaryContainer, fontSize: 11)),
                 ),
               ],
             ),
             const SizedBox(height: 8),
+
             // doctor + id copy
             Row(
               children: [
@@ -3686,16 +3805,29 @@ Widget _compactHeaderCard({
               ],
             ),
             const SizedBox(height: 6),
+
             // compact key/vals (two columns on web, single on phone)
             LayoutBuilder(builder: (_, b) {
               final twoCol = b.maxWidth >= 560;
+
               final chips = <Widget>[
-                keyVal(Icons.confirmation_number_outlined, 'Serial: ${serial.isEmpty ? '-' : serial}'),
+                keyValBold(Icons.confirmation_number_outlined, 'Serial: ${serial.isEmpty ? '-' : serial}'),
                 keyVal(Icons.flag_outlined, 'Status: ${_status.isEmpty ? '-' : _status}'),
+                keyValBold(Icons.access_time_rounded, 'Estimated time: $estDt'),
+
+                const SizedBox(height: 6),
+                const Text(
+                  'Note: Visiting time is approximate. Actual visit may be before or after this time.',
+                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+
                 keyVal(Icons.timelapse, 'Progress: ${_progress.isEmpty ? '-' : _progress}'),
-                if (amount != null) keyVal(Icons.payments_outlined, 'Amount: ${NumberFormat.currency(symbol: '').format(amount)}'),
-                if (mounted && (context.findRenderObject() != null)) const SizedBox.shrink(),
-                if (createdAt != null) keyVal(Icons.calendar_today_outlined, 'Created: ${DateFormat.yMMMd().add_jm().format(createdAt!)}'),
+                keyVal(Icons.payments_outlined, 'Total paid: ৳ ${totalPaid.toStringAsFixed(2)}'),
+               // keyVal(Icons.payments_outlined, 'Amount: ৳ ${amount.toStringAsFixed(2)}'),
+                keyVal(Icons.account_balance_wallet_outlined, 'Due amount: ৳ ${dueAmount.toStringAsFixed(2)}'),
+
+                if (createdAt != null)
+                  keyVal(Icons.calendar_today_outlined, 'Created: ${DateFormat.yMMMd().add_jm().format(createdAt)}'),
               ];
 
               if (!twoCol) {
@@ -3708,7 +3840,7 @@ Widget _compactHeaderCard({
                   ],
                 );
               }
-              // two columns (web / wide)
+
               final left = <Widget>[], right = <Widget>[];
               for (int i = 0; i < chips.length; i++) {
                 (i.isEven ? left : right).add(Padding(
@@ -3724,54 +3856,6 @@ Widget _compactHeaderCard({
                 ],
               );
             }),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _contactsCard(String phoneHospital, String phoneDoctor) {
-    return Card(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Contacts', style: Theme.of(context).textTheme.titleSmall),
-            const SizedBox(height: 6),
-            if (phoneHospital.isNotEmpty)
-              Row(children: [
-                const Icon(Icons.local_hospital, size: 18),
-                const SizedBox(width: 6),
-                Expanded(child: Text(phoneHospital)),
-                IconButton(
-                  tooltip: 'Copy',
-                  onPressed: () async { await Clipboard.setData(ClipboardData(text: phoneHospital)); showSnack(context, 'Copied'); },
-                  icon: const Icon(Icons.copy),
-                ),
-                IconButton(
-                  tooltip: 'Call',
-                  onPressed: () => launchUrl(Uri.parse('tel:$phoneHospital')),
-                  icon: const Icon(Icons.phone),
-                ),
-              ]),
-            if (phoneDoctor.isNotEmpty)
-              Row(children: [
-                const Icon(Icons.person, size: 18),
-                const SizedBox(width: 6),
-                Expanded(child: Text(phoneDoctor)),
-                IconButton(
-                  tooltip: 'Copy',
-                  onPressed: () async { await Clipboard.setData(ClipboardData(text: phoneDoctor)); showSnack(context, 'Copied'); },
-                  icon: const Icon(Icons.copy),
-                ),
-                IconButton(
-                  tooltip: 'Call',
-                  onPressed: () => launchUrl(Uri.parse('tel:$phoneDoctor')),
-                  icon: const Icon(Icons.phone),
-                ),
-              ]),
           ],
         ),
       ),
@@ -3840,8 +3924,7 @@ Widget _compactHeaderCard({
               const SizedBox(width: 8),
               Text('Rate your visit', style: Theme.of(context).textTheme.titleMedium),
               const Spacer(),
-              if (_existingRating != null)
-                const Text('You can update', style: TextStyle(fontSize: 12)),
+              if (_existingRating != null) const Text('You can update', style: TextStyle(fontSize: 12)),
             ]),
             const SizedBox(height: 8),
             if (_existingRating != null) ...[
@@ -3851,7 +3934,8 @@ Widget _compactHeaderCard({
                   final active = idx <= (existingStars ?? 0);
                   return Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 1),
-                    child: Icon(active ? Icons.star_rounded : Icons.star_outline_rounded, size: 20, color: Colors.amber),
+                    child: Icon(active ? Icons.star_rounded : Icons.star_outline_rounded,
+                        size: 20, color: Colors.amber),
                   );
                 }),
               ),
@@ -3872,7 +3956,8 @@ Widget _compactHeaderCard({
                   onTap: () => setState(() => _stars = idx),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 2),
-                    child: Icon(active ? Icons.star_rounded : Icons.star_outline_rounded, size: 34, color: Colors.amber),
+                    child: Icon(active ? Icons.star_rounded : Icons.star_outline_rounded,
+                        size: 34, color: Colors.amber),
                   ),
                 );
               }),
@@ -3900,7 +3985,50 @@ Widget _compactHeaderCard({
       ),
     );
   }
+    Widget _paymentNoteCard({
+      required String visitMode,
+      required num visitingFee,
+    }) {
+      final bool isOnline = visitMode.toLowerCase().contains('online');
+
+      // Offline minimum = 10% of visiting fee
+      final num minPay = (visitingFee * 0.10);
+
+      //  title always same
+      final String title = 'Payment required';
+
+      final String msg = isOnline
+          ? 'For online appointments, please pay the full amount (৳${visitingFee.toStringAsFixed(0)}) to confirm your appointment.'
+          : 'For offline appointments, please pay at least 10% of the visiting fee (৳${minPay.toStringAsFixed(0)}) to confirm your appointment.';
+
+      return Card(
+        elevation: 0,
+        color: Colors.amber.withOpacity(0.15),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.info_outline),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 4),
+                    Text(msg),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Reschedule bottom sheet (unique class name)

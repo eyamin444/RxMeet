@@ -3726,7 +3726,7 @@ doc.addPage(
                         onPressed: () => _openInAppFile('Prescription (file)', fileUrl),
                         icon: const Icon(Icons.open_in_full),
                       ),
-                      // ✅ download original
+                      //    download original
                       IconButton(
                         tooltip: 'Download',
                         onPressed: () => _openExternal(fileUrl),
@@ -3774,7 +3774,7 @@ doc.addPage(
                             icon: const Icon(Icons.open_in_full),
                             onPressed: () => _openInAppFile(title, url),
                           ),
-                          // ✅ download original
+                          //    download original
                           IconButton(
                             tooltip: 'Download',
                             icon: const Icon(Icons.download),
