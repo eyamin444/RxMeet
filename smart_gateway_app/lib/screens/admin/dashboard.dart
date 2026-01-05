@@ -42,7 +42,7 @@ String extractFilePath(dynamic row) {
   if (row is String) return row.trim();
 
   if (row is Map) {
-    //    possible keys backend might return
+    // possible keys backend might return
     const possibleKeys = [
       'file_path',
       'path',
@@ -57,13 +57,13 @@ String extractFilePath(dynamic row) {
       'image_url',
     ];
 
-    //    check direct keys first
+    // check direct keys first
     for (final k in possibleKeys) {
       final v = row[k];
       if (v is String && v.trim().isNotEmpty) return v.trim();
     }
 
-    //    check common nested objects
+    // check common nested objects
     const nestedObjects = ['file', 'attachment', 'document', 'report_file'];
 
     for (final nk in nestedObjects) {
@@ -164,7 +164,7 @@ Future<void> openAttachment(
 
   var p = filePathOrUrl.trim().replaceAll('\\', '/');
 
-  //    If backend returns full URL, directly open it
+  // If backend returns full URL, directly open it
   if (p.startsWith('http://') || p.startsWith('https://')) {
     final uri = Uri.parse(p);
     if (await canLaunchUrl(uri)) {
@@ -176,11 +176,11 @@ Future<void> openAttachment(
     }
   }
 
-  //    otherwise treat as server file path
+  // otherwise treat as server file path
   if (!p.startsWith('/')) p = '/$p';
 
   try {
-    //    Use auth download
+    // Use auth download
     final bytes = await Api.getBytes(p);
 
     if (bytes.isEmpty) {
@@ -188,12 +188,12 @@ Future<void> openAttachment(
       return;
     }
 
-    //    detect file type
+    // detect file type
     final lowerName = filename.toLowerCase();
     final lowerPath = p.toLowerCase();
     final isPdf = lowerName.endsWith('.pdf') || lowerPath.endsWith('.pdf');
 
-    //    pdf -> share/download
+    // pdf -> share/download
     if (isPdf) {
       await downloadBytes(
         bytes,
@@ -202,7 +202,7 @@ Future<void> openAttachment(
       return;
     }
 
-    //    show image preview
+    // show image preview
     await showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -329,7 +329,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
   }
 }
 
-/// ───────────────────── Doctors (search; patient-style list) ─────────────────────
+/// ───────────────────── Doctors ─────────────────────
 
 class _AdminDoctorsTab extends StatefulWidget {
   const _AdminDoctorsTab();
@@ -424,8 +424,7 @@ class _AdminDoctorsTabState extends State<_AdminDoctorsTab> {
                       return personTile(
                         context: ctx,
                         title: d.name,
-                        subtitle:
-                            '${d.specialty} • ${d.category ?? 'General'}',
+                        subtitle: '${d.specialty} • ${d.category ?? 'General'}',
                         trailing: '★ ${d.rating ?? 5}',
                         onTap: () => Navigator.of(ctx).push(
                           MaterialPageRoute(
@@ -767,21 +766,20 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
     super.dispose();
   }
 
-  // ───────────────────────── Helpers ─────────────────────────
-
+  // Helpers
   int _apptId(Map<String, dynamic> a) {
     final idDyn = a['id'];
     return (idDyn is num) ? idDyn.toInt() : int.tryParse('$idDyn') ?? 0;
   }
 
-  String _status(Map<String, dynamic> a) => (a['status'] ?? '').toString().trim();
+  String _status(Map<String, dynamic> a) =>
+      (a['status'] ?? '').toString().trim();
 
   DateTime? _parseDate(dynamic v) {
     if (v == null) return null;
     if (v is DateTime) return v;
     if (v is String) return DateTime.tryParse(v);
     if (v is int) {
-      // support seconds or millis
       if (v < 10000000000) return DateTime.fromMillisecondsSinceEpoch(v * 1000);
       return DateTime.fromMillisecondsSinceEpoch(v);
     }
@@ -846,52 +844,40 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
         t.contains('waiting');
   }
 
-  /// ✅ Sort rule:
-  /// 1) Unapproved on top
-  /// 2) If both unapproved -> earliest created_at first (who took first)
-  /// 3) Otherwise -> newest start_time first
   int _sortCompare(Map<String, dynamic> a, Map<String, dynamic> b) {
     final ua = _isUnapprovedStatus(_status(a));
     final ub = _isUnapprovedStatus(_status(b));
 
-    // 1) unapproved always on top
     if (ua != ub) return ua ? -1 : 1;
 
-    // 2) if both unapproved -> booked first = created_at ASC
     if (ua && ub) {
       final ca = _created(a) ?? DateTime.fromMillisecondsSinceEpoch(0);
       final cb = _created(b) ?? DateTime.fromMillisecondsSinceEpoch(0);
 
       final c = ca.compareTo(cb);
       if (c != 0) return c;
-
-      // tie-breaker: smaller id first
       return _apptId(a).compareTo(_apptId(b));
     }
 
-    // 3) others -> newest first (start_time DESC)
     final ta = _start(a) ?? DateTime.fromMillisecondsSinceEpoch(0);
     final tb = _start(b) ?? DateTime.fromMillisecondsSinceEpoch(0);
 
     final t = tb.compareTo(ta);
     if (t != 0) return t;
 
-    // fallback: newest created_at DESC
     final ca = _created(a) ?? DateTime.fromMillisecondsSinceEpoch(0);
     final cb = _created(b) ?? DateTime.fromMillisecondsSinceEpoch(0);
     return cb.compareTo(ca);
   }
 
-  // ───────────────────────── Load + Enrich Names ─────────────────────────
-
   Future<void> _load() async {
     setState(() => loading = true);
     try {
       final res = await Api.get('/admin/appointments');
-      final list = (res as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      final list =
+          (res as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
       _all = list;
 
-      // important: ensure doctor/patient names exist for search + UI
       await _enrichDoctorPatientNames(_all);
 
       _apply(resetPage: true);
@@ -932,7 +918,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       }
     }
 
-    // fetch doctors
     for (final id in doctorIds) {
       try {
         final r = await Api.get('/doctors/$id');
@@ -943,7 +928,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       } catch (_) {}
     }
 
-    // fetch patients
     for (final id in patientIds) {
       try {
         dynamic r;
@@ -959,29 +943,28 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       } catch (_) {}
     }
 
-    // attach normalized names so search is instant
     for (final a in rows) {
       a['_doctor_name'] = _doctorName(a);
       a['_patient_name'] = _patientName(a);
     }
   }
 
-  // ───────────────────────── Apply search + filters + sort + pagination ─────────────────────────
-
   void _apply({bool resetPage = false}) {
     final q = qCtrl.text.trim().toLowerCase();
 
     List<Map<String, dynamic>> rows = List<Map<String, dynamic>>.from(_all);
 
-    // Status filter
     if (_statusFilter != 'all') {
-      rows = rows.where((a) => _status(a).toLowerCase() == _statusFilter).toList();
+      rows = rows
+          .where((a) => _status(a).toLowerCase() == _statusFilter)
+          .toList();
     }
 
-    // Date filter (by start_time local date)
     if (_dateRange != null) {
-      final from = DateTime(_dateRange!.start.year, _dateRange!.start.month, _dateRange!.start.day);
-      final to = DateTime(_dateRange!.end.year, _dateRange!.end.month, _dateRange!.end.day, 23, 59, 59);
+      final from = DateTime(_dateRange!.start.year, _dateRange!.start.month,
+          _dateRange!.start.day);
+      final to = DateTime(_dateRange!.end.year, _dateRange!.end.month,
+          _dateRange!.end.day, 23, 59, 59);
 
       rows = rows.where((a) {
         final st = _start(a);
@@ -991,7 +974,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       }).toList();
     }
 
-    // Search filter (doctor/patient/id)
     if (q.isNotEmpty) {
       rows = rows.where((a) {
         final id = _apptId(a).toString();
@@ -1001,9 +983,7 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       }).toList();
     }
 
-    // Sort
     rows.sort(_sortCompare);
-
     total = rows.length;
 
     if (resetPage) page = 1;
@@ -1014,7 +994,9 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
     if (pages == 0) page = 1;
 
     final startIndex = (page - 1) * pageSize;
-    final endIndex = (startIndex + pageSize) > rows.length ? rows.length : (startIndex + pageSize);
+    final endIndex = (startIndex + pageSize) > rows.length
+        ? rows.length
+        : (startIndex + pageSize);
 
     _view = rows.isEmpty ? [] : rows.sublist(startIndex, endIndex);
 
@@ -1025,7 +1007,8 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
     final now = DateTime.now();
     final initial = _dateRange ??
         DateTimeRange(
-          start: DateTime(now.year, now.month, now.day).subtract(const Duration(days: 7)),
+          start: DateTime(now.year, now.month, now.day)
+              .subtract(const Duration(days: 7)),
           end: DateTime(now.year, now.month, now.day),
         );
 
@@ -1062,7 +1045,7 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       (map[key] ??= []).add(a);
     }
 
-    final keys = map.keys.toList()..sort((a, b) => b.compareTo(a)); // newest day first
+    final keys = map.keys.toList()..sort((a, b) => b.compareTo(a));
 
     return keys.map((k) {
       final list = map[k] ?? <Map<String, dynamic>>[];
@@ -1070,8 +1053,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       return _DayGroup(day: k, items: list);
     }).toList();
   }
-
-  // ───────────────────────── UI ─────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -1082,7 +1063,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
       onRefresh: _load,
       child: Column(
         children: [
-          // ONE LINE: search + status + date + clear
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
             child: Row(
@@ -1094,7 +1074,8 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                     decoration: InputDecoration(
                       prefixIcon: const Icon(Icons.search),
                       hintText: 'Search doctor, patient, appointment id',
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(28)),
+                      border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(28)),
                       isDense: true,
                       filled: true,
                     ),
@@ -1103,17 +1084,20 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                   ),
                 ),
                 const SizedBox(width: 8),
-
                 Expanded(
                   flex: 2,
                   child: DropdownButtonFormField<String>(
                     value: _statusFilter,
                     items: const [
                       DropdownMenuItem(value: 'all', child: Text('All')),
-                      DropdownMenuItem(value: 'requested', child: Text('Requested')),
-                      DropdownMenuItem(value: 'approved', child: Text('Approved')),
-                      DropdownMenuItem(value: 'rejected', child: Text('Rejected')),
-                      DropdownMenuItem(value: 'cancelled', child: Text('Cancelled')),
+                      DropdownMenuItem(
+                          value: 'requested', child: Text('Requested')),
+                      DropdownMenuItem(
+                          value: 'approved', child: Text('Approved')),
+                      DropdownMenuItem(
+                          value: 'rejected', child: Text('Rejected')),
+                      DropdownMenuItem(
+                          value: 'cancelled', child: Text('Cancelled')),
                     ],
                     onChanged: (v) {
                       if (v == null) return;
@@ -1128,7 +1112,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                   ),
                 ),
                 const SizedBox(width: 8),
-
                 Expanded(
                   flex: 3,
                   child: OutlinedButton.icon(
@@ -1143,7 +1126,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                     onPressed: _pickDateRange,
                   ),
                 ),
-
                 const SizedBox(width: 8),
                 IconButton(
                   tooltip: 'Clear filters',
@@ -1153,10 +1135,7 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
               ],
             ),
           ),
-
           if (loading) const LinearProgressIndicator(),
-
-          // Grouped list
           Expanded(
             child: (!loading && total == 0)
                 ? ListView(
@@ -1178,7 +1157,8 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                             padding: const EdgeInsets.fromLTRB(6, 12, 6, 6),
                             child: Text(
                               dfDay.format(g.day),
-                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w800, fontSize: 16),
                             ),
                           ),
                           ...g.items.map((a) => _apptCard(ctx, a)).toList(),
@@ -1187,8 +1167,6 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                     },
                   ),
           ),
-
-          // Pagination
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             child: Row(
@@ -1228,15 +1206,12 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
     );
   }
 
-  // ───────────────────────── Card ─────────────────────────
-
   Widget _apptCard(BuildContext ctx, Map<String, dynamic> a) {
     final id = _apptId(a);
 
     final st = _start(a);
     final en = _end(a);
 
-    // keep time info (NOT visiting time). If you want remove time completely, delete this "when" block.
     final when = [
       if (st != null) dfFull.format(st.toLocal()),
       if (en != null) '→ ${dfFull.format(en.toLocal())}',
@@ -1256,7 +1231,8 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
         onTap: () {
           if (id > 0) {
             Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => AppointmentDetailPage(apptId: id)),
+              MaterialPageRoute(
+                  builder: (_) => AppointmentDetailPage(apptId: id)),
             );
           }
         },
@@ -1265,10 +1241,9 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text('Appointment #$id', style: const TextStyle(fontWeight: FontWeight.w800)),
+              Text('Appointment #$id',
+                  style: const TextStyle(fontWeight: FontWeight.w800)),
               const SizedBox(height: 4),
-
-              // ✅ show doctor + patient name always
               Text(
                 [
                   if (doctor.isNotEmpty) 'Doctor: $doctor',
@@ -1277,12 +1252,10 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
-
               if (when.isNotEmpty) ...[
                 const SizedBox(height: 3),
                 Text(when, maxLines: 2, overflow: TextOverflow.ellipsis),
               ],
-
               const SizedBox(height: 8),
               Wrap(
                 spacing: 8,
@@ -1294,7 +1267,9 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
                     onPressed: id == 0
                         ? null
                         : () => Navigator.of(context).push(
-                              MaterialPageRoute(builder: (_) => AppointmentDetailPage(apptId: id)),
+                              MaterialPageRoute(
+                                  builder: (_) =>
+                                      AppointmentDetailPage(apptId: id)),
                             ),
                     icon: const Icon(Icons.open_in_new, size: 18),
                     label: const Text('Open'),
@@ -1318,7 +1293,9 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
         fg = Colors.blue.shade800;
         break;
       default:
-        if (t.contains('requested') || t.contains('pending') || t.contains('unapproved')) {
+        if (t.contains('requested') ||
+            t.contains('pending') ||
+            t.contains('unapproved')) {
           bg = Colors.orange.withOpacity(.16);
           fg = Colors.orange.shade900;
         } else if (t.contains('approved') || t.contains('paid')) {
@@ -1335,8 +1312,10 @@ class _AdminAppointmentsTabState extends State<_AdminAppointmentsTab> {
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(24)),
-      child: Text(text.isEmpty ? '—' : text, style: TextStyle(color: fg, fontWeight: FontWeight.w700)),
+      decoration:
+          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(24)),
+      child: Text(text.isEmpty ? '—' : text,
+          style: TextStyle(color: fg, fontWeight: FontWeight.w700)),
     );
   }
 }
@@ -1346,7 +1325,6 @@ class _DayGroup {
   final List<Map<String, dynamic>> items;
   _DayGroup({required this.day, required this.items});
 }
-
 
 /// ─────────────────────────── Admin Profile ───────────────────────────
 
@@ -1441,13 +1419,17 @@ class _AdminProfileTabState extends State<_AdminProfileTab> {
                   CircleAvatar(
                     radius: 30,
                     child: Text(
-                      widget.me.name.isNotEmpty ? widget.me.name[0].toUpperCase() : '?',
-                      style: theme.textTheme.titleLarge?.copyWith(color: Colors.white),
+                      widget.me.name.isNotEmpty
+                          ? widget.me.name[0].toUpperCase()
+                          : '?',
+                      style: theme.textTheme.titleLarge
+                          ?.copyWith(color: Colors.white),
                     ),
                   ),
                   const SizedBox(width: 16),
                   Expanded(
-                    child: Text(widget.me.name, style: theme.textTheme.titleLarge),
+                    child:
+                        Text(widget.me.name, style: theme.textTheme.titleLarge),
                   ),
                   FilledButton.icon(
                     onPressed: savingInfo ? null : _save,
@@ -1543,7 +1525,8 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
     final bg = (m?['background'] ?? '').toString();
 
     return Scaffold(
-      appBar: AppBar(title: Text(name.isNotEmpty ? name : 'Doctor #${widget.doctorId}')),
+      appBar:
+          AppBar(title: Text(name.isNotEmpty ? name : 'Doctor #${widget.doctorId}')),
       body: loading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
@@ -1551,7 +1534,8 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
               children: [
                 Row(
                   children: [
-                    const CircleAvatar(radius: 28, child: Icon(Icons.local_hospital)),
+                    const CircleAvatar(
+                        radius: 28, child: Icon(Icons.local_hospital)),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
@@ -1594,6 +1578,69 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
   }
 }
 
+/// ─────────────────────────── TOP-LEVEL typed slot model (FIX) ───────────────────────────
+
+class _BlockSlot {
+  final DateTime start;
+  final DateTime end;
+  final String mode; // online/offline/...
+  const _BlockSlot({required this.start, required this.end, required this.mode});
+}
+
+String _modeOf(dynamic row) {
+  final m = (row is Map) ? row : <String, dynamic>{};
+  final s = (m['visit_mode'] ?? m['mode'] ?? m['type'] ?? '')
+      .toString()
+      .toLowerCase()
+      .trim();
+  if (s.contains('on')) return 'online';
+  if (s.contains('off')) return 'offline';
+  return s.isEmpty ? 'unknown' : s;
+}
+
+IconData _modeIcon(String mode) {
+  switch (mode) {
+    case 'online':
+      return Icons.wifi;
+    case 'offline':
+      return Icons.local_hospital;
+    default:
+      return Icons.help_outline;
+  }
+}
+
+String _modeLabel(String mode) {
+  switch (mode) {
+    case 'online':
+      return 'Online';
+    case 'offline':
+      return 'Offline';
+    default:
+      return '—';
+  }
+}
+
+DateTime? _parseBlockTime(String raw, DateTime day) {
+  final v = raw.trim();
+  if (v.isEmpty) return null;
+
+  // ISO date-time
+  final iso = DateTime.tryParse(v);
+  if (iso != null) return iso.toLocal();
+
+  // HH:mm
+  final m = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(v);
+  if (m != null) {
+    final h = int.tryParse(m.group(1)!) ?? 0;
+    final min = int.tryParse(m.group(2)!) ?? 0;
+    return DateTime(day.year, day.month, day.day, h, min).toLocal();
+  }
+
+  return null;
+}
+
+/// ─────────────────────────── Doctor Availability ───────────────────────────
+
 class DoctorAvailabilityPage extends StatefulWidget {
   const DoctorAvailabilityPage({super.key, required this.doctorId});
   final int doctorId;
@@ -1604,7 +1651,7 @@ class DoctorAvailabilityPage extends StatefulWidget {
 
 class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
   final dfDate = DateFormat.yMMMd();
-  final dfTime = DateFormat.Hm();
+  final dfTime = DateFormat.jm();
 
   bool loading = true;
   bool loadingWeek = true;
@@ -1612,10 +1659,13 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
   late DateTime _from;
   late DateTime _to;
 
-  final Map<DateTime, List<Map<String, DateTime>>> _slotsByDay = {};
+  // day -> list of blocks (typed)
+  final Map<DateTime, List<_BlockSlot>> _slotsByDay = {};
+
   List<Map<String, dynamic>> _appts = [];
 
   int _tabIndex = 0; // 0 availability, 1 appointments
+  String _modeFilter = 'all'; // all / online / offline
 
   @override
   void initState() {
@@ -1648,62 +1698,52 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
 
   Future<void> _loadAvailability() async {
     final id = widget.doctorId;
-    final qs = {
-      'doctor_id': id,
-      'start': _from.toIso8601String(),
-      'end': _to.toIso8601String(),
-    };
 
-    final urls = <String>[
-      '/doctors/$id/availability',
-      '/doctor/$id/availability',
-      '/availability',
-      '/appointments/slots',
-      '/doctors/$id/slots',
-    ];
+    _slotsByDay.clear();
 
-    dynamic res;
-    for (final u in urls) {
+    DateTime day = DateTime(_from.year, _from.month, _from.day);
+    final last =
+        DateTime(_to.year, _to.month, _to.day).subtract(const Duration(days: 1));
+
+    while (!day.isAfter(last)) {
+      final dayKey =
+          '${day.year.toString().padLeft(4, '0')}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}';
+
       try {
-        res = await Api.get(u, query: qs);
-        if (res != null) break;
-      } catch (_) {}
-    }
-    if (res == null) return;
+        final res = await Api.get(
+          '/doctors/$id/blocks',
+          query: {
+            'day': dayKey,
+            if (_modeFilter != 'all') 'visit_mode': _modeFilter,
+          },
+        );
 
-    final slots = <Map<String, DateTime>>[];
+        if (res is List && res.isNotEmpty) {
+          final key = DateTime(day.year, day.month, day.day);
 
-    if (res is Map && res['slots'] is List) {
-      for (final s in (res['slots'] as List)) {
-        final m = s is Map ? Map<String, dynamic>.from(s) : <String, dynamic>{};
-        final st = DateTime.tryParse('${m['start'] ?? m['from'] ?? ''}');
-        final en = DateTime.tryParse('${m['end'] ?? m['to'] ?? ''}');
-        if (st != null && en != null) slots.add({'start': st, 'end': en});
-      }
-    } else if (res is List) {
-      for (final s in res) {
-        if (s is String) {
-          final st = DateTime.tryParse(s);
-          if (st != null) {
-            slots.add({'start': st, 'end': st.add(const Duration(minutes: 30))});
+          for (final row in res) {
+            final m = row is Map ? Map<String, dynamic>.from(row) : <String, dynamic>{};
+
+            final startRaw =
+                (m['start'] ?? m['time_from'] ?? m['from'] ?? '').toString();
+            final endRaw =
+                (m['end'] ?? m['time_to'] ?? m['to'] ?? '').toString();
+
+            final st = _parseBlockTime(startRaw, key);
+            final en = _parseBlockTime(endRaw, key);
+
+            if (st != null && en != null) {
+              (_slotsByDay[key] ??= []).add(
+                _BlockSlot(start: st, end: en, mode: _modeOf(m)),
+              );
+            }
           }
-        } else if (s is Map) {
-          final m = Map<String, dynamic>.from(s);
-          final st = DateTime.tryParse('${m['start'] ?? m['from'] ?? ''}');
-          final en = DateTime.tryParse('${m['end'] ?? m['to'] ?? ''}');
-          if (st != null && en != null) slots.add({'start': st, 'end': en});
+
+          _slotsByDay[key]!.sort((a, b) => a.start.compareTo(b.start));
         }
-      }
-    }
+      } catch (_) {}
 
-    for (final slot in slots) {
-      final st = slot['start']!;
-      final key = DateTime(st.year, st.month, st.day);
-      (_slotsByDay[key] ??= []).add(slot);
-    }
-
-    for (final k in _slotsByDay.keys) {
-      _slotsByDay[k]!.sort((a, b) => a['start']!.compareTo(b['start']!));
+      day = day.add(const Duration(days: 1));
     }
   }
 
@@ -1722,6 +1762,8 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
           'doctor_id': id,
           'from': _from.toIso8601String(),
           'to': _to.toIso8601String(),
+          if (_modeFilter != 'all') 'visit_mode': _modeFilter,
+          if (_modeFilter != 'all') 'mode': _modeFilter,
         });
         if (res != null) break;
       } catch (_) {}
@@ -1736,15 +1778,17 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
           .toList();
     }
 
-    _appts = rows.where((a) {
-      DateTime? st;
-      final v = a['start_time'];
-      if (v is String) st = DateTime.tryParse(v);
-      if (v is DateTime) st = v;
-      if (st == null) return false;
-      return st.isAfter(_from.subtract(const Duration(seconds: 1))) &&
-          st.isBefore(_to.add(const Duration(seconds: 1)));
-    }).toList()
+    _appts = rows
+        .where((a) {
+          DateTime? st;
+          final v = a['start_time'];
+          if (v is String) st = DateTime.tryParse(v);
+          if (v is DateTime) st = v;
+          if (st == null) return false;
+          return st.isAfter(_from.subtract(const Duration(seconds: 1))) &&
+              st.isBefore(_to.add(const Duration(seconds: 1)));
+        })
+        .toList()
       ..sort((a, b) {
         final A = DateTime.tryParse('${a['start_time']}') ?? DateTime(1970);
         final B = DateTime.tryParse('${b['start_time']}') ?? DateTime(1970);
@@ -1810,23 +1854,45 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
                     ],
                   ),
                 ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
-                  child: SegmentedButton<int>(
-                    segments: const [
-                      ButtonSegment(
-                          value: 0,
-                          icon: Icon(Icons.event_available),
-                          label: Text('Availability')),
-                      ButtonSegment(
-                          value: 1,
-                          icon: Icon(Icons.event_note),
-                          label: Text('Appointments')),
-                    ],
-                    selected: {_tabIndex},
-                    onSelectionChanged: (s) =>
-                        setState(() => _tabIndex = s.first),
-                  ),
+                Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
+                      child: SegmentedButton<int>(
+                        segments: const [
+                          ButtonSegment(
+                            value: 0,
+                            icon: Icon(Icons.event_available),
+                            label: Text('Availability'),
+                          ),
+                          ButtonSegment(
+                            value: 1,
+                            icon: Icon(Icons.event_note),
+                            label: Text('Appointments'),
+                          ),
+                        ],
+                        selected: {_tabIndex},
+                        onSelectionChanged: (s) =>
+                            setState(() => _tabIndex = s.first),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+                      child: SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(value: 'all', label: Text('All')),
+                          ButtonSegment(value: 'online', label: Text('Online')),
+                          ButtonSegment(
+                              value: 'offline', label: Text('Offline')),
+                        ],
+                        selected: {_modeFilter},
+                        onSelectionChanged: (s) {
+                          setState(() => _modeFilter = s.first);
+                          _load();
+                        },
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 4),
                 Expanded(
@@ -1873,17 +1939,28 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
                 Wrap(
                   spacing: 10,
                   runSpacing: 10,
-                  children: slots.map((s) {
-                    final st = s['start']!;
-                    final en = s['end']!;
+                  children: slots.map<Widget>((slot) {
+                    final mode = slot.mode;
+
                     return Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(999),
-                        color: Theme.of(context).colorScheme.primary.withOpacity(.10),
+                        color: Theme.of(context)
+                            .colorScheme
+                            .primary
+                            .withOpacity(.10),
                       ),
-                      child: Text(
-                          '${dfTime.format(st.toLocal())} – ${dfTime.format(en.toLocal())}'),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(_modeIcon(mode), size: 16),
+                          const SizedBox(width: 6),
+                          Text(
+                              '${dfTime.format(slot.start)} – ${dfTime.format(slot.end)}'),
+                        ],
+                      ),
                     );
                   }).toList(),
                 ),
@@ -1928,6 +2005,8 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
 
         final status = (a['status'] ?? '').toString();
         final pay = (a['payment_status'] ?? '').toString();
+        final mode = _modeOf(a);
+
         final pat = a['patient'];
         final patientName =
             (pat is Map && pat['name'] != null) ? '${pat['name']}' : '';
@@ -1954,8 +2033,10 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
                       style: const TextStyle(fontWeight: FontWeight.w700)),
                   const SizedBox(height: 2),
                   Text(
-                    [if (patientName.isNotEmpty) patientName, if (when.isNotEmpty) when]
-                        .join(' • '),
+                    [
+                      if (patientName.isNotEmpty) patientName,
+                      if (when.isNotEmpty) when
+                    ].join(' • '),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -1964,8 +2045,29 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
                     spacing: 8,
                     runSpacing: 8,
                     children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context)
+                              .colorScheme
+                              .primary
+                              .withOpacity(.10),
+                          borderRadius: BorderRadius.circular(24),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(_modeIcon(mode), size: 16),
+                            const SizedBox(width: 6),
+                            Text(_modeLabel(mode),
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w600)),
+                          ],
+                        ),
+                      ),
                       _pill('Status: $status'),
-                      _pill('Payment: $pay', color: Colors.blue),
+                      if (pay.isNotEmpty) _pill('Payment: $pay', color: Colors.blue),
                     ],
                   ),
                 ],
@@ -1983,11 +2085,14 @@ class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
     final fg = mat.shade800;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(24)),
-      child: Text(text, style: TextStyle(color: fg, fontWeight: FontWeight.w600)),
+      decoration:
+          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(24)),
+      child: Text(text,
+          style: TextStyle(color: fg, fontWeight: FontWeight.w600)),
     );
   }
 }
+
 
 /// ─────────────────────────── Patient Detail (with appt history) ───────────────────────────
 

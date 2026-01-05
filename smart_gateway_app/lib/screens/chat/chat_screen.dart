@@ -533,63 +533,123 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Widget _bubbleContent(_ChatMessage m) {
-    if (m.kind == _MsgKind.image) {
-      if (m.imageUrl != null && m.imageUrl!.isNotEmpty) {
-        return ClipRRect(
-          borderRadius: BorderRadius.circular(10),
-          child: Image.network(m.imageUrl!, width: 220, height: 220, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Text('Image failed')),
-        );
-      }
-      if (m.localImageBytes != null) {
-        return ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.memory(m.localImageBytes!, width: 220, height: 220, fit: BoxFit.cover));
-      }
-      return const Text('Image');
+Widget _bubbleContent(_ChatMessage m) {
+  if (m.kind == _MsgKind.image) {
+    if (m.imageUrl != null && m.imageUrl!.isNotEmpty) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.network(
+          m.imageUrl!,
+          width: 220,
+          height: 220,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => const Text('Image failed'),
+        ),
+      );
     }
-    return Text(m.body ?? '', style: const TextStyle(fontSize: 15));
+    if (m.localImageBytes != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.memory(
+          m.localImageBytes!,
+          width: 220,
+          height: 220,
+          fit: BoxFit.cover,
+        ),
+      );
+    }
+    return const Text('Image');
   }
 
-  Widget _buildMessageTile(_ChatMessage m) {
-    final isMe = _isMe(m);
-    final align = isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start;
-    final bubbleColor = isMe ? Colors.teal.shade100 : Colors.grey.shade200;
-    final time = DateFormat.Hm().format(m.createdAt);
-    final status = _statusLabel(m, isMe);
+  //   Long text wraps and grows bubble background naturally (no fixed size)
+  return Text(
+    m.body ?? '',
+    softWrap: true,
+    overflow: TextOverflow.visible,
+    style: const TextStyle(fontSize: 15),
+  );
+}
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Row(mainAxisAlignment: isMe ? MainAxisAlignment.end : MainAxisAlignment.start, children: [
+Widget _buildMessageTile(_ChatMessage m) {
+  final isMe = _isMe(m);
+  final align = isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start;
+  final bubbleColor = isMe ? Colors.teal.shade100 : Colors.grey.shade200;
+  final time = DateFormat.Hm().format(m.createdAt);
+  final status = _statusLabel(m, isMe);
+
+  final w = MediaQuery.of(context).size.width;
+  final maxBubbleWidth = (w * 0.75).clamp(220.0, 520.0); //   responsive, no overflow
+
+  return Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+    child: Row(
+      mainAxisAlignment: isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
         if (!isMe) const SizedBox(width: 6),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 760),
-          child: Container(
-            decoration: BoxDecoration(color: bubbleColor, borderRadius: BorderRadius.circular(10)),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: Column(crossAxisAlignment: align, children: [
-              _bubbleContent(m),
-              const SizedBox(height: 6),
-              Row(mainAxisSize: MainAxisSize.min, children: [
-                Text(time, style: const TextStyle(fontSize: 11, color: Colors.black54)),
-                if (status.isNotEmpty) ...[
-                  const SizedBox(width: 8),
-                  Text(status, style: const TextStyle(fontSize: 11, color: Colors.black54)),
-                ],
-                if (m.status == _MsgStatus.failed) ...[
-                  const SizedBox(width: 8),
-                  InkWell(onTap: () => _retry(m), child: const Row(children: [Icon(Icons.error_outline, color: Colors.red, size: 14), SizedBox(width: 4), Text('Retry', style: TextStyle(color: Colors.red, fontSize: 12))])),
-                ],
-                if (m.status == _MsgStatus.sending) ...[
-                  const SizedBox(width: 8),
-                  const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.5)),
-                ],
-              ]),
-            ]),
+
+        //   Flexible prevents overflow inside Row, bubble grows only within max width
+        Flexible(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxBubbleWidth),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: bubbleColor,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: align,
+                  children: [
+                    _bubbleContent(m),
+
+                    const SizedBox(height: 6),
+
+                    //   Meta line wraps if needed, doesn't overflow
+                    Wrap(
+                      spacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(time, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+                        if (status.isNotEmpty)
+                          Text(status, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+                        if (m.status == _MsgStatus.failed)
+                          InkWell(
+                            onTap: () => _retry(m),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.error_outline, color: Colors.red, size: 14),
+                                SizedBox(width: 4),
+                                Text('Retry', style: TextStyle(color: Colors.red, fontSize: 12)),
+                              ],
+                            ),
+                          ),
+                        if (m.status == _MsgStatus.sending)
+                          const SizedBox(
+                            width: 12,
+                            height: 12,
+                            child: CircularProgressIndicator(strokeWidth: 1.5),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ),
+
         if (isMe) const SizedBox(width: 6),
-      ]),
-    );
-  }
+      ],
+    ),
+  );
+}
+
+
+
 
   Future<void> _onRefresh() async => _loadMessages();
 

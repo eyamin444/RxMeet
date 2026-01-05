@@ -4128,17 +4128,32 @@ class _PatientProfilePageState extends State<PatientProfilePage> {
     );
   }
 
-  Future<void> _openFile(Map<String, dynamic> m) async {
-    final url = _absUrl(m);
-    if (url == null) return;
-    if (_looksLikeImage(url)) {
-      await _openImage(url);
-      return;
+Future<void> _openFile(Map<String, dynamic> m) async {
+  // 1) Try normal file URL (uploaded prescription or backend-provided file_url)
+  String? url = _absUrl(m);
+
+  // 2) Fallback for TEXT prescription: open server-generated PDF
+  if (url == null || url.isEmpty) {
+    final apptId = m['appointment_id'] ?? m['appointmentId'];
+    if (apptId != null) {
+      url = '${Api.baseUrl}/appointments/$apptId/prescription/pdf';
     }
-    final uri = Uri.parse(url);
-    if (!await canLaunchUrl(uri)) return;
-    await launchUrl(uri, mode: LaunchMode.externalApplication);
   }
+
+  if (url == null || url.isEmpty) return;
+
+  // If image, show inside app
+  if (_looksLikeImage(url)) {
+    await _openImage(url);
+    return;
+  }
+
+  // PDFs/others: open externally (or you can route to your in-app viewer)
+  final uri = Uri.parse(url);
+  if (!await canLaunchUrl(uri)) return;
+  await launchUrl(uri, mode: LaunchMode.externalApplication);
+}
+
 
   Future<void> _load() async {
     try {
@@ -4223,12 +4238,61 @@ class _PatientProfilePageState extends State<PatientProfilePage> {
           if (prescriptions.isEmpty)
             const Text('No prescriptions yet.')
           else
-            ...prescriptions.map((p) => ListTile(
-                  leading: const Icon(Icons.medication_liquid),
-                  title: Text(p['title']?.toString() ?? 'Prescription'),
-                  subtitle: Text(p['created_at']?.toString() ?? ''),
-                  onTap: () => _openFile(p),
-                )),
+            ...prescriptions.map((p) {
+              // detect prescription type
+              final String? type = p['type']?.toString();
+              final String? fileUrl = p['file_url']?.toString();
+              final String? pdfUrl = p['pdf_url']?.toString();
+              final String? filePath = p['file_path']?.toString(); // sometimes available
+              final apptId = p['appointment_id'] ?? p['appointmentId'];
+
+              // 1) Title should NEVER show JSON content
+              String title = 'Prescription';
+              if (type == 'text') {
+                title = 'Text Prescription';
+              } else if (type == 'file') {
+                // show the filename if available
+                final fp = filePath ?? fileUrl ?? '';
+                title = fp.isEmpty ? 'Uploaded Prescription' : fp.split('/').last;
+              }
+
+              // 2) Subtitle: nice timestamp
+              final created = p['created_at']?.toString() ?? '';
+
+              // 3) Decide what to open
+              // If file exists, open file_url. If text exists, open pdf_url.
+              String? openUrl = fileUrl;
+              if (type == 'text') {
+                openUrl = pdfUrl;
+                // fallback if backend didn’t send pdf_url
+                if ((openUrl == null || openUrl.isEmpty) && apptId != null) {
+                  openUrl = '/appointments/$apptId/prescription/pdf';
+                }
+              }
+
+              // If backend didn’t send file_url for file type, also fallback
+              if ((openUrl == null || openUrl.isEmpty) && apptId != null) {
+                openUrl = '/appointments/$apptId/prescription/pdf';
+              }
+
+              return ListTile(
+                leading: Icon(type == 'text'
+                    ? Icons.description
+                    : Icons.medication_liquid),
+                title: Text(title),
+                subtitle: Text(created),
+                trailing: Icon(type == 'text'
+                    ? Icons.picture_as_pdf
+                    : Icons.download),
+                onTap: () {
+                  // Ensure _openFile receives something openable
+                  final payload = Map<String, dynamic>.from(p);
+                  payload['file_url'] = openUrl;
+                  _openFile(payload);
+                },
+              );
+            }),
+
         ],
       ),
     );

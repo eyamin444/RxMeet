@@ -43,7 +43,7 @@ JWT_ALG = os.getenv("JWT_ALG", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "240"))
 HOSPITAL_HOTLINE = os.getenv("HOSPITAL_HOTLINE", "+88000000000")
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://192.168.0.102:7880")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws:// 192.168.0.102:7880")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "devsecret_1234567890_1234567890_ABCDEFG")
 
@@ -245,7 +245,8 @@ class Patient(Base):
 
 class Appointment(Base):
     __tablename__ = "appointments"
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=False)
+
     patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
     doctor_id = Column(Integer, ForeignKey("doctors.id"), nullable=False)
     start_time = Column(DateTime, nullable=False)
@@ -265,7 +266,6 @@ class Appointment(Base):
     last_modified_by_user_id = Column(Integer, nullable=True)
     last_modified_at = Column(DateTime, nullable=True)
 
-    # New columns
     serial_number = Column(Integer, nullable=True)
     estimated_visit_time = Column(DateTime, nullable=True)
 
@@ -274,9 +274,7 @@ class Appointment(Base):
     prescription = relationship("Prescription", back_populates="appointment", uselist=False)
     rating = relationship("DoctorRating", back_populates="appointment", uselist=False)
 
-    # Payments: one-to-many
     payments = relationship("Payment", back_populates="appointment", cascade="all, delete-orphan")
-
     changes = relationship("AppointmentChangeLog", back_populates="appointment", cascade="all, delete-orphan")
     notes_thread = relationship("AppointmentNote", back_populates="appointment", cascade="all, delete-orphan")
 
@@ -311,7 +309,6 @@ class Prescription(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=True)  # <— NEW
     appointment = relationship("Appointment", back_populates="prescription")
-
 
 class MedicalReport(Base):
     __tablename__ = "medical_reports"
@@ -484,6 +481,26 @@ def ensure_sqlite_schema(engine):
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+def generate_appointment_id(db: Session, appt_date: date) -> int:
+    """
+    Generates Appointment.id like: YYYYMMDD0001 (globally per day)
+    Example: 2026-01-05 -> 202601050001
+    """
+    prefix = appt_date.strftime("%Y%m%d")  # "20260105"
+
+    start_id = int(prefix + "0000")
+    end_id = int(prefix + "99999")
+
+    last_id = (
+        db.query(func.max(Appointment.id))
+        .filter(Appointment.id >= start_id, Appointment.id <= end_id)
+        .scalar()
+    )
+
+    if last_id:
+        return int(last_id) + 1
+    return int(prefix + "0001")
+
 def create_db():
     Base.metadata.create_all(bind=engine)
 
@@ -2317,7 +2334,6 @@ def browse_doctors(
     out.sort(key=_sort_key)
     return out
 
-# Add near your public routes in FastAPI
 @app.get("/doctors/{doctor_id}/education", response_model=List[DoctorEduOut])
 def list_doctor_education(doctor_id: int, db: Session = Depends(get_db)):
     d = db.get(Doctor, doctor_id)
@@ -2338,7 +2354,7 @@ def _first_available_date(db: Session, doctor_id: int, start_d: dt_date, end_d: 
     d = start_d
     # safety
     scans = 0
-    while d <= end_d and scans < 120:
+    while d <= end_d and scans < 45:
         scans += 1
         blocks = gen_blocks_for_date(db, doctor_id, d, mode)
         if blocks:
@@ -2401,16 +2417,34 @@ def doctor_blocks_for_date(
 @app.post("/appointments", response_model=AppointmentOut)
 def request_appointment(payload: AppointmentIn, db: Session = Depends(get_db),
                         current: User = Depends(require_role(UserRole.patient))):
+
     p = current.patient_profile
-    if not p: raise HTTPException(400, "Patient profile missing")
+    if not p:
+        raise HTTPException(400, "Patient profile missing")
+
     if slot_capacity_left(db, payload.doctor_id, payload.start_time, payload.end_time) <= 0:
         raise HTTPException(400, "Selected slot is not available")
-    appt = Appointment(patient_id=p.id, doctor_id=payload.doctor_id,
-                       start_time=payload.start_time, end_time=payload.end_time,
-                       status=AppointmentStatus.requested, payment_status=PaymentStatus.pending,
-                       visit_mode=payload.visit_mode, patient_problem=payload.patient_problem or "",
-                       last_modified_by_user_id=current.id, last_modified_at=datetime.utcnow())
-    db.add(appt); db.commit(); db.refresh(appt)
+
+    # ✅ Generate custom id (globally per day)
+    custom_id = generate_appointment_id(db, payload.start_time.date())
+
+    appt = Appointment(
+        id=custom_id,  # ✅ THIS MAKES id like 202601050001
+        patient_id=p.id,
+        doctor_id=payload.doctor_id,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        status=AppointmentStatus.requested,
+        payment_status=PaymentStatus.pending,
+        visit_mode=payload.visit_mode,
+        patient_problem=payload.patient_problem or "",
+        last_modified_by_user_id=current.id,
+        last_modified_at=datetime.utcnow(),
+    )
+
+    db.add(appt)
+    db.commit()
+    db.refresh(appt)
     return appt
 
 @app.post("/appointments/request_multipart", response_model=AppointmentOut)
@@ -2426,19 +2460,41 @@ def request_appointment_multipart(
 ):
     st, et = datetime.fromisoformat(start_time), datetime.fromisoformat(end_time)
     p = current.patient_profile
-    if not p: raise HTTPException(400, "Patient profile missing")
+    if not p:
+        raise HTTPException(400, "Patient profile missing")
+
     if slot_capacity_left(db, doctor_id, st, et) <= 0:
         raise HTTPException(400, "Selected slot is not available")
+
+    # Save photo if provided
     path = None
     if disease_photo is not None:
         fname = f"dis_{current.id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{disease_photo.filename}"
         path = os.path.join("uploads", fname)
-        with open(path, "wb") as f: f.write(disease_photo.file.read())
-    appt = Appointment(patient_id=p.id, doctor_id=doctor_id, start_time=st, end_time=et,
-                       status=AppointmentStatus.requested, payment_status=PaymentStatus.pending,
-                       visit_mode=visit_mode, patient_problem=patient_problem or "", disease_photo_path=path,
-                       last_modified_by_user_id=current.id, last_modified_at=datetime.utcnow())
-    db.add(appt); db.commit(); db.refresh(appt)
+        with open(path, "wb") as f:
+            f.write(disease_photo.file.read())
+
+    # ✅ Generate custom id (globally per day) ALWAYS
+    custom_id = generate_appointment_id(db, st.date())
+
+    appt = Appointment(
+        id=custom_id,
+        patient_id=p.id,
+        doctor_id=doctor_id,
+        start_time=st,
+        end_time=et,
+        status=AppointmentStatus.requested,
+        payment_status=PaymentStatus.pending,
+        visit_mode=visit_mode,
+        patient_problem=patient_problem or "",
+        disease_photo_path=path,
+        last_modified_by_user_id=current.id,
+        last_modified_at=datetime.utcnow(),
+    )
+
+    db.add(appt)
+    db.commit()
+    db.refresh(appt)
     return appt
 
 # appointment detail
@@ -2604,7 +2660,6 @@ async def pay_for_appointment(
         db.rollback()
         raise HTTPException(500, f"Failed to record payment: {e}")
 
-# near other endpoints in app.py
 import traceback
 from fastapi import Body
 
@@ -4054,53 +4109,125 @@ def list_patient_prescriptions(patient_id: int,
                                current: User = Depends(get_current_user),
                                db: Session = Depends(get_db)):
     p = db.get(Patient, patient_id)
-    if not p: raise HTTPException(404, "Not found")
+    if not p:
+        raise HTTPException(404, "Not found")
+
     if current.role == UserRole.patient and p.user_id != current.id:
         raise HTTPException(403, "Forbidden")
+
     if current.role == UserRole.doctor:
         has_rel = db.query(Appointment).filter(
             Appointment.patient_id == p.id,
             Appointment.doctor.has(user_id=current.id)
         ).first()
-        if not has_rel: raise HTTPException(403, "Forbidden")
+        if not has_rel:
+            raise HTTPException(403, "Forbidden")
 
-    rows = (db.query(Prescription)
-              .join(Appointment, Prescription.appointment_id == Appointment.id)
-              .filter(Appointment.patient_id == p.id)
-              .order_by(Prescription.created_at.desc()).all())
+    rows = (
+        db.query(Prescription)
+        .join(Appointment, Prescription.appointment_id == Appointment.id)
+        .filter(Appointment.patient_id == p.id)
+        .order_by(Prescription.created_at.desc())
+        .all()
+    )
+
     out = []
     for r in rows:
+        # Always provide a PDF url so written prescription can be opened
+        pdf_url = f"/appointments/{r.appointment_id}/prescription/pdf"
+
+        file_url = None
+        if r.file_path:
+            file_url = ("/" + r.file_path) if not r.file_path.startswith("/") else r.file_path
+        else:
+            file_url = pdf_url
+
         out.append({
             "id": r.id,
             "appointment_id": r.appointment_id,
             "title": "Prescription",
             "created_at": r.created_at.isoformat(),
-            "file_url": ("/" + r.file_path) if r.file_path and not r.file_path.startswith("/") else r.file_path,
+            "file_url": file_url,
+            "pdf_url": pdf_url,
             "content": r.content,
         })
+
     return out
 
+
 @app.get("/patient/profile", response_model=dict)
-def get_patient_profile(current: User = Depends(require_role(UserRole.patient)), db: Session = Depends(get_db)):
+def get_patient_profile(
+    current: User = Depends(require_role(UserRole.patient)),
+    db: Session = Depends(get_db)
+):
     p = current.patient_profile
-    if not p: raise HTTPException(400, "Patient profile missing")
-    appts = (db.query(Appointment).filter(Appointment.patient_id == p.id)
-             .order_by(Appointment.start_time.desc()).all())
-    reports = (db.query(MedicalReport).filter(MedicalReport.patient_id == p.id)
-               .order_by(MedicalReport.uploaded_at.desc()).all())
+    if not p:
+        raise HTTPException(400, "Patient profile missing")
+
+    appts = (
+        db.query(Appointment)
+        .filter(Appointment.patient_id == p.id)
+        .order_by(Appointment.start_time.desc())
+        .all()
+    )
+
+    reports = (
+        db.query(MedicalReport)
+        .filter(MedicalReport.patient_id == p.id)
+        .order_by(MedicalReport.uploaded_at.desc())
+        .all()
+    )
+
     prescs = []
     for ap in appts:
         if ap.prescription:
-            prescs.append({"appointment_id": ap.id, "content": ap.prescription.content, "file_path": ap.prescription.file_path})
+            pdf_url = f"/appointments/{ap.id}/prescription/pdf"
+
+            file_url = None
+            if ap.prescription.file_path:
+                file_url = ("/" + ap.prescription.file_path) if not ap.prescription.file_path.startswith("/") else ap.prescription.file_path
+            else:
+                file_url = pdf_url
+
+            prescs.append({
+                "appointment_id": ap.id,
+                "title": "Prescription",
+                "content": ap.prescription.content,
+                "file_path": ap.prescription.file_path,
+                "file_url": file_url,
+                "pdf_url": pdf_url,
+            })
+
     return {
         "profile": {
-            "age": p.age, "weight": p.weight, "height": p.height, "blood_group": p.blood_group,
-            "gender": p.gender, "description": p.description, "current_medicine": p.current_medicine,
-            "medical_history": p.medical_history
+            "age": p.age,
+            "weight": p.weight,
+            "height": p.height,
+            "blood_group": p.blood_group,
+            "gender": p.gender,
+            "description": p.description,
+            "current_medicine": p.current_medicine,
+            "medical_history": p.medical_history,
         },
-        "appointments": [{"id": a.id, "start_time": a.start_time, "end_time": a.end_time,
-                          "status": a.status.value, "progress": a.progress.value} for a in appts],
-        "reports": [{"id": r.id, "name": r.original_name, "at": r.uploaded_at, "file_path": r.file_path} for r in reports],
+        "appointments": [
+            {
+                "id": a.id,
+                "start_time": a.start_time,
+                "end_time": a.end_time,
+                "status": a.status.value,
+                "progress": a.progress.value,
+            }
+            for a in appts
+        ],
+        "reports": [
+            {
+                "id": r.id,
+                "name": r.original_name,
+                "at": r.uploaded_at,
+                "file_path": r.file_path,
+            }
+            for r in reports
+        ],
         "prescriptions": prescs,
     }
 
@@ -4223,13 +4350,58 @@ from reportlab.graphics import renderPDF as _renderQR
 
 DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-def _rx_decode(content: str) -> dict:
-    """Decode JSON-ish prescription content into a dict. Tolerant of plain text."""
-    try:
-        import json
-        return (json.loads(content) if content else {}) or {}
-    except Exception:
-        return {"diagnosis": content or "", "advice": "", "follow_up": None, "medicines": []}
+def _rx_decode(content) -> dict:
+    """
+    Decode JSON-ish prescription content into a dict.
+    Tolerant of plain text and different backend shapes.
+    """
+    import json
+
+    # Already dict?
+    if isinstance(content, dict):
+        data = content
+    else:
+        s = (content or "").strip()
+        if not s:
+            data = {}
+        else:
+            try:
+                data = json.loads(s)
+            except Exception:
+                # plain text fallback
+                return {
+                    "diagnosis": s,
+                    "advice": "",
+                    "follow_up": None,
+                    "medicines": [],
+                }
+
+    if not isinstance(data, dict):
+        data = {}
+
+    #   normalize meds -> medicines
+    if "medicines" not in data or data.get("medicines") is None:
+        if isinstance(data.get("meds"), list):
+            data["medicines"] = data["meds"]
+        elif isinstance(data.get("medicine_list"), list):
+            data["medicines"] = data["medicine_list"]
+        else:
+            data["medicines"] = []
+
+    #   normalize follow_up keys
+    if data.get("follow_up") is None:
+        data["follow_up"] = data.get("followup") or data.get("follow_up_date")
+
+    #   normalize advice keys
+    if not data.get("advice"):
+        data["advice"] = data.get("instructions") or data.get("note") or ""
+
+    #   ensure vitals is dict
+    if not isinstance(data.get("vitals"), dict):
+        data["vitals"] = {}
+
+    return data
+
 
 def _visiting_summary(db: Session, doctor_id: int) -> str:
     """
@@ -4377,12 +4549,59 @@ def prescription_pdf(
         raise HTTPException(403, "Forbidden")
 
     # -------- helpers (scoped) ----------
-    def _rx_decode(content: str) -> dict:
-        try:
-            import json
-            return (json.loads(content) if content else {}) or {}
-        except Exception:
-            return {"diagnosis": content or "", "advice": "", "follow_up": None, "medicines": []}
+
+    #   FIXED: robust decoder + key normalization (meds -> medicines)
+    def _rx_decode(content) -> dict:
+        """
+        Decode JSON-ish prescription content into a dict.
+        Tolerant of plain text and different backend shapes.
+        """
+        import json
+
+        # Already dict?
+        if isinstance(content, dict):
+            data = content
+        else:
+            s = (content or "").strip()
+            if not s:
+                data = {}
+            else:
+                try:
+                    data = json.loads(s)
+                except Exception:
+                    # plain text fallback
+                    return {
+                        "diagnosis": s,
+                        "advice": "",
+                        "follow_up": None,
+                        "medicines": [],
+                    }
+
+        if not isinstance(data, dict):
+            data = {}
+
+        #   normalize meds -> medicines (and other possible keys)
+        if "medicines" not in data or data.get("medicines") is None:
+            if isinstance(data.get("meds"), list):
+                data["medicines"] = data["meds"]
+            elif isinstance(data.get("medicine_list"), list):
+                data["medicines"] = data["medicine_list"]
+            else:
+                data["medicines"] = []
+
+        #   normalize follow_up keys
+        if data.get("follow_up") is None:
+            data["follow_up"] = data.get("followup") or data.get("follow_up_date")
+
+        #   normalize advice keys
+        if not data.get("advice"):
+            data["advice"] = data.get("instructions") or data.get("note") or ""
+
+        #   ensure vitals is dict
+        if not isinstance(data.get("vitals"), dict):
+            data["vitals"] = {}
+
+        return data
 
     def _fit(text: str, font="Helvetica", size=10, max_w=120):
         text = (text or "").strip()
@@ -4567,6 +4786,35 @@ def prescription_pdf(
         c.setFillColorRGB(0.25, 0.35, 0.33)
         c.drawString(right_x, rx_y - 40, _fit(diagnosis, size=10, max_w=card_w - left_w - 30*mm))
 
+    #   Medicines block (keeps your font/UI)
+    meds = data.get("medicines") or []
+    if meds:
+        start_y = rx_y - 64
+        c.setFont("Helvetica-Bold", 10.5)
+        c.setFillColor(colors.black)
+        c.drawString(right_x, start_y, "Medicines")
+        yy = start_y - 14
+        c.setFont("Helvetica", 10)
+        for i, m in enumerate(meds[:10], start=1):
+            if isinstance(m, dict):
+                name = (m.get("name") or m.get("medicine") or m.get("title") or "").strip()
+                dose = (m.get("dosage") or m.get("dose") or "").strip()
+                dur = (m.get("duration") or m.get("days") or "").strip()
+                after = (m.get("after") or m.get("note") or m.get("instruction") or "").strip()
+                line = f"{i}. {name}"
+                if dose:
+                    line += f"  •  {dose}"
+                if after:
+                    line += f"  •  {after}"
+                if dur:
+                    line += f"  •  {dur}"
+            else:
+                line = f"{i}. {str(m)}"
+            c.drawString(right_x, yy, _fit(line, size=10, max_w=card_w - left_w - 28*mm))
+            yy -= 12
+            if yy < card_y + 45*mm:
+                break
+
     if show_qr:
         qr_size = 26*mm
         qr_x = card_x + card_w - (10*mm) - qr_size
@@ -4736,21 +4984,13 @@ class MessageIn(BaseModel):
     body: str
     kind: Optional[str] = "text"
 # ------------------------- Chat: model, helpers, endpoints -------------------------
-# Place this block in app.py (replace your existing chat block). It depends on:
-# - sqlalchemy.orm Session, text, engine, Base
-# - models: User, Appointment, DeviceToken, Message
-# - firebase_admin.messaging as messaging
-# - get_current_user, get_db, datetime, os
+
 from typing import List, Optional, Set, Dict
 from fastapi import Request, UploadFile, File, Form, Query, HTTPException
 from sqlalchemy import text
 from datetime import datetime
 import os
 import time
-
-# firebase_admin.messaging should already be imported as `messaging`
-# If not, add:
-# from firebase_admin import messaging
 
 # Appointment-scoped chat (file-capable)
 class AppointmentMessage(Base):

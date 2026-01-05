@@ -6,19 +6,16 @@
 // - Patient books a schedule BLOCK (window), not a minute slot
 // - Patient sees only THEIR OWN serial number
 // - My Appointments: tabs (Pending default, History), search, sort, ASC/DESC,
-//   pagination 10/page, row Delete (History only, soft-delete semantics)
 // - Appointment Detail: cancel/change (only when progress == 'not_yet'),
 //   rate after completion, scoped files (upload & patient-owned delete),
 //   online video/chat, contact number copy/call (doctor & hospital),
 //   show doctor name + avatar and copyable appointment ID, "View profile"
-// - Logout navigates to LoginPage (no reload)
 // - Payment History tab with receipt download
-//
-// NOTE: Some backend behaviors (reminders & email) are triggered server-side.
-//
-// ignore_for_file: use_build_context_synchronously
+
+
 
 import 'dart:typed_data';
+import 'dart:convert';
 
 import 'dart:ui' as ui;
 import 'dart:io' show File;
@@ -46,6 +43,8 @@ import '../../services/notification_sync.dart';
 import '../payment/payment_screen.dart';
 import 'package:smart_gateway_app/utils/download.dart';
 import 'package:smart_gateway_app/utils/print_helper.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
 //import 'package:smart_gateway_app/debug/test_notifications.dart';
 
 
@@ -199,7 +198,7 @@ final GlobalKey<_MyAppointmentsTabState> _apptsKey = GlobalKey<_MyAppointmentsTa
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FULL DOCTORS TAB (responsive / overflow-safe) 
+//  FULL DOCTORS TAB 
 // ─────────────────────────────────────────────────────────────────────────────
 
 class BrowseDoctorsTab extends StatefulWidget {
@@ -1142,7 +1141,7 @@ class _BrowseDoctorsTabState extends State<BrowseDoctorsTab> {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Doctor profile (bio, degrees, ratings) — Eclips-style UI (no extra imports)
+// Doctor profile 
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _DoctorProfile extends StatefulWidget {
@@ -2651,6 +2650,46 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
     return null;
   }
 
+  Map<String, dynamic> _rxPayloadFromItem(Map<String, dynamic> item) {
+  final rawContent = item['content'] ?? item['data']?['content'];
+
+  if (rawContent is Map) {
+    return rawContent.cast<String, dynamic>();
+  }
+
+  final s = rawContent?.toString().trim() ?? '';
+  if (s.isNotEmpty) {
+    try {
+      final decoded = jsonDecode(s);
+      if (decoded is Map) {
+        final map = decoded.cast<String, dynamic>();
+
+        // normalize meds -> medicines
+        if (map['medicines'] == null && map['meds'] is List) {
+          map['medicines'] = map['meds'];
+        }
+
+        return map;
+      }
+    } catch (_) {
+      return {
+        'diagnosis': s,
+        'advice': '',
+        'follow_up': '',
+        'medicines': [],
+      };
+    }
+  }
+
+  return {
+    'diagnosis': '',
+    'advice': '',
+    'follow_up': '',
+    'medicines': [],
+  };
+}
+
+
   String? _getStringPath(Map m, String path) {
     dynamic cur = m;
     for (final part in path.split('.')) {
@@ -2753,28 +2792,52 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
     return '${Api.baseUrl}/$p';
   }
 
-  // robust URL extraction for a record
+ // robust URL extraction for a record
   String? _anyUrl(Map<String, dynamic> m) {
+    //  Common direct URL keys
     const keys = ['file_url', 'url', 'file_path', 'path', 'pdf_url'];
+ 
+
+    // 1) direct keys
     for (final k in keys) {
       final v = m[k]?.toString();
-      if (v != null && v.isNotEmpty) {
-        if (v.startsWith('http')) return v;
-        return '${Api.baseUrl}${v.startsWith('/') ? v : '/$v'}';
+      if (v != null && v.trim().isNotEmpty) {
+        final s = v.trim();
+        if (s.startsWith('http')) return s;
+        return '${Api.baseUrl}${s.startsWith('/') ? s : '/$s'}';
       }
     }
+
+    // 2) nested data map
     final data = (m['data'] is Map) ? (m['data'] as Map).cast<String, dynamic>() : null;
     if (data != null) {
       for (final k in keys) {
         final v = data[k]?.toString();
-        if (v != null && v.isNotEmpty) {
-          if (v.startsWith('http')) return v;
-          return '${Api.baseUrl}${v.startsWith('/') ? v : '/$v'}';
+        if (v != null && v.trim().isNotEmpty) {
+          final s = v.trim();
+          if (s.startsWith('http')) return s;
+          return '${Api.baseUrl}${s.startsWith('/') ? s : '/$s'}';
         }
       }
     }
+
+    //   3)  if written prescription exists but no file url exists
+    // then open the generated PDF
+    final content = (m['content'] ?? (data?['content']))?.toString().trim();
+    if (content != null && content.isNotEmpty) {
+      // Try to use appointment_id from the prescription item
+      final apptId = m['appointment_id'] ?? m['appointmentId'] ?? data?['appointment_id'];
+      if (apptId != null) {
+        return '${Api.baseUrl}/appointments/$apptId/prescription/pdf';
+      }
+
+      // Final fallback: current appointment id (this detail page)
+      return '${Api.baseUrl}/appointments/${widget.apptId}/prescription/pdf';
+    }
+
     return null;
   }
+
 
   // ---------------- lifecycle ----------------
   @override
@@ -3042,19 +3105,22 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
     try {
       String? _fromContentDisposition(String? cd) {
         if (cd == null) return null;
-        final mStar = RegExp(r'''filename\*\s*=\s*[^']*''([^;]+)''''', caseSensitive: false)
-            .firstMatch(cd);
-        if (mStar != null) {
-          return Uri.decodeFull(mStar.group(1)!.trim());
-        }
-        final mQuoted = RegExp(r'''filename\s*=\s*"([^"]+)"''', caseSensitive: false).firstMatch(cd);
-        if (mQuoted != null) {
-          return mQuoted.group(1)!.trim();
-        }
-        final mBare = RegExp(r'''filename\s*=\s*([^;]+)''', caseSensitive: false).firstMatch(cd);
-        if (mBare != null) {
-          return mBare.group(1)!.trim();
-        }
+
+        final mStar =
+            RegExp(r'''filename\*\s*=\s*[^']*''([^;]+)''''', caseSensitive: false)
+                .firstMatch(cd);
+        if (mStar != null) return Uri.decodeFull(mStar.group(1)!.trim());
+
+        final mQuoted =
+            RegExp(r'''filename\s*=\s*"([^"]+)"''', caseSensitive: false)
+                .firstMatch(cd);
+        if (mQuoted != null) return mQuoted.group(1)!.trim();
+
+        final mBare =
+            RegExp(r'''filename\s*=\s*([^;]+)''', caseSensitive: false)
+                .firstMatch(cd);
+        if (mBare != null) return mBare.group(1)!.trim();
+
         return null;
       }
 
@@ -3079,21 +3145,29 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
       String _ensureExt(String name, {String? urlPath, String? mime}) {
         final hasExt = name.contains('.') && !name.endsWith('.');
         if (hasExt) return name;
+
         final segs = (urlPath ?? '').split('/').where((s) => s.isNotEmpty).toList();
         final last = segs.isNotEmpty ? segs.last : '';
+
         if (last.contains('.')) {
           final ext = last.substring(last.lastIndexOf('.'));
           return name.isEmpty ? last : name + ext;
         }
+
         final guess = _extFromMime(mime);
-        if (guess.isNotEmpty) return name.isEmpty ? 'document' + guess : name + guess;
-        return name.isEmpty ? 'document.pdf' : name + '.pdf';
+        if (guess.isNotEmpty) return name.isEmpty ? 'document$guess' : name + guess;
+
+        return name.isEmpty ? 'document.pdf' : '$name.pdf';
       }
 
+      //   Build proper URL
       final isAbsolute = url.startsWith('http://') || url.startsWith('https://');
       final requestUri = isAbsolute ? Uri.parse(url) : Uri.parse('${Api.baseUrl}$url');
-      final dio = Dio();
-      final res = await dio.getUri<List<int>>(
+
+      //   IMPORTANT FIX:
+      // Use Api.client instead of Dio()
+      // Api.client already injects Authorization: Bearer token automatically
+      final res = await Api.client.getUri<List<int>>(
         requestUri,
         options: Options(
           responseType: ResponseType.bytes,
@@ -3108,12 +3182,15 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
           res.data != null) {
         final cd = res.headers.value('content-disposition');
         final ctype = res.headers.value('content-type');
+
         final fromCd = _fromContentDisposition(cd);
         String name = (fromCd ?? suggested).trim();
         name = _ensureExt(name, urlPath: requestUri.path, mime: ctype);
+
         final bytes = Uint8List.fromList(res.data!);
         await downloadBytes(bytes, name);
       } else {
+        // fallback open in browser
         await openUrlExternal(url);
       }
     } catch (e) {
@@ -3643,7 +3720,56 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
                         onPressed: () => _downloadFile(url, title),
                         icon: const Icon(Icons.download),
                       ),
+
+                      onTapOverride: (url, title) async {
+                        // find the tapped prescription item (by title+url match)
+                        // since our ListTile doesn't pass item directly, we re-check from prescriptions list
+                        Map<String, dynamic>? match;
+
+                        for (final item in prescriptions) {
+                          final itemUrl = _anyUrl(item);
+                          final itemTitle = (item['title'] ?? 'Prescription').toString();
+                          if (itemUrl == url || itemTitle == title) {
+                            match = item;
+                            break;
+                          }
+                        }
+
+                        // If has text content -> show pad preview
+                        if (match != null) {
+                          final hasText = (match['content'] ?? '').toString().trim().isNotEmpty;
+                          if (hasText) {
+                            final payload = _rxPayloadFromItem(match);
+
+                            showDialog(
+                              context: context,
+                              builder: (_) => Dialog(
+                                clipBehavior: Clip.antiAlias,
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: SingleChildScrollView(
+                                    child: _RxPadPreview(
+                                      payload: payload,
+                                      patient: appt, // contains patient info often
+                                      doctor: appt?['doctor'] is Map
+                                          ? (appt!['doctor'] as Map).cast<String, dynamic>()
+                                          : null,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+                        }
+
+                        // Otherwise download/open file/pdf
+                        if (url == null) return;
+                        await _downloadFile(url, title);
+                      },
+
               ),
+
 
               const Divider(height: 24),
 
@@ -3872,6 +3998,7 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
     required String? Function(Map<String, dynamic>) urlOf,
     required int? Function(Map<String, dynamic>) idOf,
     required Widget? Function(String? url, int? id, String title) trailingBuilder,
+    Future<void> Function(String? url, String title)? onTapOverride,
   }) {
     return Column(
       children: [
@@ -3898,7 +4025,16 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
                 leading: Icon(icon),
                 title: Text(t, maxLines: 1, overflow: TextOverflow.ellipsis),
                 subtitle: created.isEmpty ? null : Text(created),
-                onTap: url == null ? null : () => showDocLightbox(context, title: t, url: url),
+                onTap: url == null
+                ? null
+                : () async {
+                    if (onTapOverride != null) {
+                      await onTapOverride(url, t);
+                    } else {
+                      showDocLightbox(context, title: t, url: url);
+                    }
+                  },
+
                 trailing: trailingBuilder(url, id, t),
               ),
             );
@@ -4027,6 +4163,212 @@ class _AppointmentDetailPageState extends State<_AppointmentDetailPage> {
         ),
       );
     }
+}
+
+class _RxPadPreview extends StatelessWidget {
+  const _RxPadPreview({
+    super.key,
+    required this.payload,
+    this.patient,
+    this.doctor,
+  });
+
+  final Map<String, dynamic> payload;
+  final Map<String, dynamic>? patient;
+  final Map<String, dynamic>? doctor;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = payload;
+    final meds = (p['medicines'] as List? ?? const [])
+        .whereType<Map>()
+        .map((e) => e.cast<String, dynamic>())
+        .toList();
+
+    String _str(dynamic v) => (v ?? '').toString().trim();
+
+    final diagnosis = _str(p['diagnosis']);
+    final advice = _str(p['advice']);
+    final followUp = _str(p['follow_up']);
+
+    final patientName = _str(patient?['patient_name'] ?? patient?['name'] ?? patient?['profile']?['name']);
+    final patientAge = _str(patient?['patient_age'] ?? patient?['age'] ?? patient?['profile']?['age']);
+    final patientId = _str(patient?['patient_id'] ?? patient?['id']);
+
+    final doctorName = _str(doctor?['name'] ?? doctor?['doctor_name']);
+    final doctorSpec = _str(doctor?['specialty']);
+    final doctorReg = _str(doctor?['reg_no'] ?? doctor?['registration'] ?? doctor?['license']);
+
+    final now = DateFormat.yMMMd().add_Hm().format(DateTime.now());
+
+    return Container(
+      width: 680,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        border: Border.all(color: Theme.of(context).dividerColor),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.local_hospital, size: 32, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      doctorName.isEmpty ? 'Doctor' : doctorName,
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                    ),
+                    Row(
+                      children: [
+                        if (doctorSpec.isNotEmpty) Text(doctorSpec),
+                        if (doctorSpec.isNotEmpty && doctorReg.isNotEmpty) const SizedBox(width: 10),
+                        if (doctorReg.isNotEmpty)
+                          Text('Reg: $doctorReg', style: const TextStyle(color: Colors.black54)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              Text(now, style: const TextStyle(color: Colors.black54)),
+            ],
+          ),
+          const SizedBox(height: 12),
+          const Divider(),
+
+          // Patient line
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Wrap(
+              spacing: 14,
+              runSpacing: 6,
+              children: [
+                _Pill(patientName.isEmpty ? 'Patient' : patientName, icon: Icons.person_outline),
+                if (patientId.isNotEmpty) _Pill('ID: $patientId', icon: Icons.numbers),
+                if (patientAge.isNotEmpty) _Pill('Age: $patientAge', icon: Icons.cake_outlined),
+              ],
+            ),
+          ),
+
+          // Diagnosis
+          if (diagnosis.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text('Diagnosis', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(diagnosis),
+          ],
+
+          // Medicines
+          const SizedBox(height: 10),
+          Text('Medicines', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 6),
+          if (meds.isEmpty)
+            const Text('— None —', style: TextStyle(color: Colors.black54))
+          else
+            ...List.generate(meds.length, (i) {
+              final m = meds[i];
+              final name = _str(m['name']);
+              final dose = _str(m['dose']);
+              final form = _str(m['form']);
+              final freq = _str(m['frequency']);
+              final dur = _str(m['duration']);
+              final notes = _str(m['notes']);
+
+              final lineTop = [
+                if (name.isNotEmpty) name,
+                if (dose.isNotEmpty) '($dose)',
+                if (form.isNotEmpty) '• $form',
+              ].join(' ');
+              final lineBottom = [
+                if (freq.isNotEmpty) 'Frequency: $freq',
+                if (dur.isNotEmpty) 'Duration: $dur',
+                if (notes.isNotEmpty) 'Notes: $notes',
+              ].join('   ');
+
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('${i + 1}.  ', style: const TextStyle(fontWeight: FontWeight.w600)),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(lineTop, style: const TextStyle(fontWeight: FontWeight.w600)),
+                          if (lineBottom.isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: Text(lineBottom),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+
+          // Advice
+          if (advice.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text('Advice / Instructions', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(advice),
+          ],
+
+          // Follow up
+          if (followUp.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                const Icon(Icons.event_available, size: 18),
+                const SizedBox(width: 6),
+                Text('Follow-up: $followUp'),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _Pill extends StatelessWidget {
+  const _Pill(this.text, {this.bg, this.icon, super.key});
+
+  final String text;
+  final Color? bg;
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = bg ?? Theme.of(context).colorScheme.surfaceVariant;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 14),
+            const SizedBox(width: 6),
+          ],
+          Text(text, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
+    );
+  }
 }
 
 
@@ -4229,6 +4571,8 @@ class _ApptRescheduleSheetState extends State<_ApptRescheduleSheet> {
   }
 }
 
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BEGIN_GALLERY_TAB
 // Gallery Tab - Reports / Prescriptions (fast load + reliable download)
@@ -4242,15 +4586,13 @@ class _GalleryTab extends StatefulWidget {
 }
 
 class _GalleryTabState extends State<_GalleryTab> {
-  // Data
   List<Map<String, dynamic>> reports = [];
   List<Map<String, dynamic>> prescriptions = [];
   bool loading = true;
 
   int? _myUserId;
-  final Map<int, Map<String, dynamic>> _apptCache = {};   // fetched lazily
+  final Map<int, Map<String, dynamic>> _apptCache = {};
 
-  // ----------------------------- utils -----------------------------
   bool get _isMobile {
     final p = defaultTargetPlatform;
     return p == TargetPlatform.android || p == TargetPlatform.iOS;
@@ -4285,7 +4627,9 @@ class _GalleryTabState extends State<_GalleryTab> {
   }
 
   String _fileUrlFromPath(String pathOrUrl) {
-    var p = pathOrUrl;
+    var p = pathOrUrl.trim();
+    if (p.isEmpty) return p;
+    if (p.startsWith('http://') || p.startsWith('https://')) return p;
     if (p.startsWith('./')) p = p.substring(2);
     if (!p.startsWith('/')) p = '/$p';
     return '${Api.baseUrl}$p';
@@ -4298,7 +4642,6 @@ class _GalleryTabState extends State<_GalleryTab> {
     return (d['name'] as String?) ?? '';
   }
 
-  // ----------------------------- confirmation -----------------------------
   Future<bool> _confirm({
     required String title,
     required String message,
@@ -4328,177 +4671,160 @@ class _GalleryTabState extends State<_GalleryTab> {
     return res == true;
   }
 
-// BEGIN_DOWNLOAD_HELPER
-Future<void> _downloadUrl(String url, {String? suggestedName}) async {
-  // ── helpers ────────────────────────────────────────────────────────────────
-  String _sanitizeBase(String name) {
-    final cleaned = name.replaceAll(RegExp(r'[^A-Za-z0-9 _\.-]+'), '');
-    final collapsed = cleaned.replaceAll(RegExp(r'\s+'), ' ').trim();
-    final underscored = collapsed.replaceAll(' ', '_');
-    final safe = underscored.replaceFirst(RegExp(r'^[\.\-]+'), '');
-    return safe.isEmpty ? 'file' : (safe.length > 120 ? safe.substring(0, 120) : safe);
-  }
-
-  String _stripOneExt(String name) {
-    final idx = name.lastIndexOf('.');
-    if (idx <= 0 || idx == name.length - 1) return name;
-    final maybeExt = name.substring(idx + 1);
-    if (maybeExt.length > 5) return name; // likely not a true extension
-    return name.substring(0, idx);
-  }
-
-  String? _extFromFilename(String name) {
-    final idx = name.lastIndexOf('.');
-    if (idx <= 0 || idx == name.length - 1) return null;
-    final ext = name.substring(idx + 1).toLowerCase();
-    if (ext.length > 5) return null;
-    return ext;
-  }
-
-  String? _extFromContentType(String ct) {
-    ct = ct.toLowerCase();
-    if (ct.startsWith('image/jpeg') || ct.startsWith('image/pjpeg') || ct.startsWith('image/jpg')) return 'jpg';
-    if (ct.startsWith('image/png')) return 'png';
-    if (ct.startsWith('image/gif')) return 'gif';
-    if (ct.startsWith('image/webp')) return 'webp';
-    if (ct.startsWith('image/bmp')) return 'bmp';
-    if (ct.startsWith('image/heic')) return 'heic';
-    if (ct.startsWith('image/heif')) return 'heif';
-    if (ct.startsWith('image/tiff')) return 'tiff';
-    if (ct.startsWith('application/pdf')) return 'pdf';
-    if (ct.startsWith('text/plain')) return 'txt';
-    if (ct.startsWith('application/json')) return 'json';
-    if (ct.startsWith('application/zip')) return 'zip';
-    if (ct.contains('wordprocessingml')) return 'docx';
-    if (ct.contains('msword')) return 'doc';
-    return null;
-  }
-
-  String _mimeFromExt(String ext) {
-    switch (ext.toLowerCase()) {
-      case 'jpg':
-      case 'jpeg':
-        return 'image/jpeg';
-      case 'png':
-        return 'image/png';
-      case 'gif':
-        return 'image/gif';
-      case 'webp':
-        return 'image/webp';
-      case 'bmp':
-        return 'image/bmp';
-      case 'heic':
-        return 'image/heic';
-      case 'heif':
-        return 'image/heif';
-      case 'tiff':
-        return 'image/tiff';
-      case 'pdf':
-        return 'application/pdf';
-      case 'txt':
-        return 'text/plain';
-      case 'json':
-        return 'application/json';
-      case 'zip':
-        return 'application/zip';
-      case 'doc':
-        return 'application/msword';
-      case 'docx':
-        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-      default:
-        return 'application/octet-stream';
+  Future<void> _downloadUrl(String url, {String? suggestedName}) async {
+    String sanitizeBase(String name) {
+      final cleaned = name.replaceAll(RegExp(r'[^A-Za-z0-9 _\.-]+'), '');
+      final collapsed = cleaned.replaceAll(RegExp(r'\s+'), ' ').trim();
+      final underscored = collapsed.replaceAll(' ', '_');
+      final safe = underscored.replaceFirst(RegExp(r'^[\.\-]+'), '');
+      return safe.isEmpty ? 'file' : (safe.length > 120 ? safe.substring(0, 120) : safe);
     }
-  }
 
-  // ── derive a clean filename (base + single extension) ─────────────────────
-  final parsed = Uri.tryParse(url);
-  final lastSeg = (parsed?.pathSegments.isNotEmpty ?? false) ? parsed!.pathSegments.last : '';
-  final candidate = (suggestedName?.trim().isNotEmpty == true ? suggestedName!.trim() : lastSeg)
-      .replaceAll('%20', ' ');
+    String stripOneExt(String name) {
+      final idx = name.lastIndexOf('.');
+      if (idx <= 0 || idx == name.length - 1) return name;
+      final maybeExt = name.substring(idx + 1);
+      if (maybeExt.length > 5) return name;
+      return name.substring(0, idx);
+    }
 
-  try {
-    // fetch bytes
-    final resp = await Dio().get<List<int>>(
-      url,
-      options: Options(responseType: ResponseType.bytes, followRedirects: true),
-    );
-    final data = resp.data ?? const <int>[];
-    if (data.isEmpty) throw 'Empty response';
+    String? extFromFilename(String name) {
+      final idx = name.lastIndexOf('.');
+      if (idx <= 0 || idx == name.length - 1) return null;
+      final ext = name.substring(idx + 1).toLowerCase();
+      if (ext.length > 5) return null;
+      return ext;
+    }
 
-    final ct = resp.headers.value('content-type') ?? '';
-    String ext = _extFromContentType(ct) ?? _extFromFilename(candidate) ?? 'bin';
+    String? extFromContentType(String ct) {
+      ct = ct.toLowerCase();
+      if (ct.startsWith('image/jpeg') || ct.startsWith('image/pjpeg') || ct.startsWith('image/jpg')) return 'jpg';
+      if (ct.startsWith('image/png')) return 'png';
+      if (ct.startsWith('image/gif')) return 'gif';
+      if (ct.startsWith('image/webp')) return 'webp';
+      if (ct.startsWith('image/bmp')) return 'bmp';
+      if (ct.startsWith('image/heic')) return 'heic';
+      if (ct.startsWith('image/heif')) return 'heif';
+      if (ct.startsWith('image/tiff')) return 'tiff';
+      if (ct.startsWith('application/pdf')) return 'pdf';
+      if (ct.startsWith('text/plain')) return 'txt';
+      if (ct.startsWith('application/json')) return 'json';
+      if (ct.startsWith('application/zip')) return 'zip';
+      if (ct.contains('wordprocessingml')) return 'docx';
+      if (ct.contains('msword')) return 'doc';
+      return null;
+    }
 
-    String base = _stripOneExt(candidate);
-    if (ext.isNotEmpty) {
-      final extDot = '.${ext.toLowerCase()}';
-      // remove repeated trailing extension(s), e.g., "file.jpg.jpg"
-      while (base.toLowerCase().endsWith(extDot)) {
-        base = base.substring(0, base.length - extDot.length);
+    String mimeFromExt(String ext) {
+      switch (ext.toLowerCase()) {
+        case 'jpg':
+        case 'jpeg':
+          return 'image/jpeg';
+        case 'png':
+          return 'image/png';
+        case 'gif':
+          return 'image/gif';
+        case 'webp':
+          return 'image/webp';
+        case 'bmp':
+          return 'image/bmp';
+        case 'heic':
+          return 'image/heic';
+        case 'heif':
+          return 'image/heif';
+        case 'tiff':
+          return 'image/tiff';
+        case 'pdf':
+          return 'application/pdf';
+        case 'txt':
+          return 'text/plain';
+        case 'json':
+          return 'application/json';
+        case 'zip':
+          return 'application/zip';
+        case 'doc':
+          return 'application/msword';
+        case 'docx':
+          return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        default:
+          return 'application/octet-stream';
       }
     }
-    base = _sanitizeBase(base);
-    if (base.isEmpty) base = 'file';
 
-    final fullName = '$base.$ext';
-    final bytes = Uint8List.fromList(data);
-    final mime = _mimeFromExt(ext);
+    final parsed = Uri.tryParse(url);
+    final lastSeg = (parsed?.pathSegments.isNotEmpty ?? false) ? parsed!.pathSegments.last : '';
+    final candidate = (suggestedName?.trim().isNotEmpty == true ? suggestedName!.trim() : lastSeg).replaceAll('%20', ' ');
 
-    // ── Mobile (Android/iOS): force Share Sheet to let user choose destination ──
-    if (!_kIsWeb() && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) {
-      await Share.shareXFiles(
-        [XFile.fromData(bytes, name: fullName, mimeType: mime)],
-        text: fullName,
-      );
-      showSnack(context, 'Choose a location to save $fullName');
-      return;
-    }
-
-    // ── Web / Desktop: direct save ──
     try {
-      await FileSaver.instance.saveFile(
-        name: fullName, // include extension
-        bytes: bytes,
+      final resp = await Dio().get<List<int>>(
+        url,
+        options: Options(responseType: ResponseType.bytes, followRedirects: true),
       );
-      showSnack(context, 'Saved $fullName');
-      return;
+      final data = resp.data ?? const <int>[];
+      if (data.isEmpty) throw 'Empty response';
+
+      final ct = resp.headers.value('content-type') ?? '';
+      String ext = extFromContentType(ct) ?? extFromFilename(candidate) ?? 'bin';
+
+      String base = stripOneExt(candidate);
+      if (ext.isNotEmpty) {
+        final extDot = '.${ext.toLowerCase()}';
+        while (base.toLowerCase().endsWith(extDot)) {
+          base = base.substring(0, base.length - extDot.length);
+        }
+      }
+      base = sanitizeBase(base);
+      if (base.isEmpty) base = 'file';
+
+      final fullName = '$base.$ext';
+      final bytes = Uint8List.fromList(data);
+      final mime = mimeFromExt(ext);
+
+      if (!kIsWeb && (_isMobile)) {
+        await Share.shareXFiles(
+          [XFile.fromData(bytes, name: fullName, mimeType: mime)],
+          text: fullName,
+        );
+        showSnack(context, 'Choose a location to save $fullName');
+        return;
+      }
+
+      try {
+        await FileSaver.instance.saveFile(name: fullName, bytes: bytes);
+        showSnack(context, 'Saved $fullName');
+        return;
+      } catch (_) {
+        final uri = Uri.parse(url);
+        await launchUrl(
+          uri,
+          mode: kIsWeb ? LaunchMode.platformDefault : LaunchMode.externalApplication,
+          webOnlyWindowName: '_blank',
+        );
+        showSnack(context, 'Opened externally.');
+        return;
+      }
     } catch (_) {
-      // fallback: open externally
-      final uri = Uri.parse(url);
-      await launchUrl(
-        uri,
-        mode: kIsWeb ? LaunchMode.platformDefault : LaunchMode.externalApplication,
-        webOnlyWindowName: '_blank',
-      );
-      showSnack(context, 'Opened externally.');
-      return;
+      try {
+        final uri = Uri.parse(url);
+        await launchUrl(
+          uri,
+          mode: kIsWeb ? LaunchMode.platformDefault : LaunchMode.externalApplication,
+          webOnlyWindowName: '_blank',
+        );
+      } catch (_) {}
+      showSnack(context, 'Could not download; opened instead.');
     }
-  } catch (_) {
-    try {
-      final uri = Uri.parse(url);
-      await launchUrl(
-        uri,
-        mode: kIsWeb ? LaunchMode.platformDefault : LaunchMode.externalApplication,
-        webOnlyWindowName: '_blank',
-      );
-    } catch (_) {}
-    showSnack(context, 'Could not download; opened instead.');
   }
-}
 
-bool _kIsWeb() => kIsWeb;
-// END_DOWNLOAD_HELPER
-
- // ----------------------------- deletes -----------------------------
   Future<void> _deleteReport(int reportId, {int? appointmentId}) async {
     dynamic lastErr;
     final tryList = <Future<dynamic> Function()>[
-      if (appointmentId != null)
-        () => Api.delete('/appointments/$appointmentId/reports/$reportId'),
+      if (appointmentId != null) () => Api.delete('/appointments/$appointmentId/reports/$reportId'),
       () => Api.delete('/patients/reports/$reportId'),
-      () => Api.post  ('/patients/reports/$reportId/delete'),
+      () => Api.post('/patients/reports/$reportId/delete'),
       () => Api.delete('/reports/$reportId'),
-      () => Api.post  ('/reports/$reportId/delete'),
-      () => Api.patch ('/reports/$reportId', data: {'deleted': true}),
+      () => Api.post('/reports/$reportId/delete'),
+      () => Api.patch('/reports/$reportId', data: {'deleted': true}),
     ];
 
     for (final fn in tryList) {
@@ -4518,7 +4844,7 @@ bool _kIsWeb() => kIsWeb;
     dynamic lastErr;
     final tryList = <Future<dynamic> Function()>[
       () => Api.delete('/appointments/$apptId/prescription'),
-      () => Api.post  ('/appointments/$apptId/prescription/delete'),
+      () => Api.post('/appointments/$apptId/prescription/delete'),
     ];
     for (final fn in tryList) {
       try {
@@ -4533,7 +4859,6 @@ bool _kIsWeb() => kIsWeb;
     showSnack(context, 'Delete failed: $lastErr');
   }
 
-  // ----------------------------- upload -----------------------------
   Future<void> _uploadReport() async {
     final pick = await FilePicker.platform.pickFiles(withData: true);
     if (pick == null || pick.files.isEmpty) return;
@@ -4550,11 +4875,6 @@ bool _kIsWeb() => kIsWeb;
     }
   }
 
-  // ----------------------------- loader (fast) -----------------------------
-  // Key speedups:
-  // 1) Parallel fetch of profile + reports.
-  // 2) No per-appointment requests during initial load.
-  //    Appointment details are fetched lazily only when needed.
   Future<void> _load() async {
     setState(() => loading = true);
     try {
@@ -4571,11 +4891,9 @@ bool _kIsWeb() => kIsWeb;
           .map<Map<String, dynamic>>((p) => Map<String, dynamic>.from(p))
           .toList();
 
-      // Process reports (keep appointment_id if backend provides it)
       reports = rep.map<Map<String, dynamic>>((r) {
         final m = Map<String, dynamic>.from(r as Map);
         m['uploaded_at_dt'] = _parseDt(m['uploaded_at']);
-        // If appointment_id is absent, we leave it null (filled lazily when needed).
         return m;
       }).toList()
         ..sort((a, b) {
@@ -4587,9 +4905,7 @@ bool _kIsWeb() => kIsWeb;
           return bd.compareTo(ad);
         });
 
-      // Process prescriptions
-      prescriptions = pres
-        ..sort((a, b) {
+      prescriptions = pres..sort((a, b) {
           final ad = _parseDt(a['created_at']);
           final bd = _parseDt(b['created_at']);
           if (ad == null && bd == null) return 0;
@@ -4612,7 +4928,6 @@ bool _kIsWeb() => kIsWeb;
     _load();
   }
 
-  // ----------------------------- mobile actions -----------------------------
   Future<void> _openActionsMobile({
     required String title,
     String? createdAt,
@@ -4622,8 +4937,9 @@ bool _kIsWeb() => kIsWeb;
     VoidCallback? onDownload,
     Future<void> Function()? onDeleteConfirmed,
   }) async {
-    // Lazy fetch appointment details on first open (optional)
-    if ((doctorName == null || doctorName.isEmpty) && appointmentId != null && !_apptCache.containsKey(appointmentId)) {
+    if ((doctorName == null || doctorName.isEmpty) &&
+        appointmentId != null &&
+        !_apptCache.containsKey(appointmentId)) {
       try {
         final detail = await Api.get('/appointments/$appointmentId') as Map<String, dynamic>;
         _apptCache[appointmentId] = detail;
@@ -4654,13 +4970,19 @@ bool _kIsWeb() => kIsWeb;
               ListTile(
                 leading: const Icon(Icons.open_in_new),
                 title: const Text('Open'),
-                onTap: () { Navigator.pop(ctx); onOpen(); },
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onOpen();
+                },
               ),
             if (onDownload != null)
               ListTile(
                 leading: const Icon(Icons.download),
                 title: const Text('Download'),
-                onTap: () { Navigator.pop(ctx); onDownload(); },
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDownload();
+                },
               ),
             if (onDeleteConfirmed != null)
               ListTile(
@@ -4682,7 +5004,352 @@ bool _kIsWeb() => kIsWeb;
     );
   }
 
-  // ----------------------------- build -----------------------------
+  Map<String, dynamic>? _tryJsonMap(String s) {
+    try {
+      final v = jsonDecode(s);
+      if (v is Map<String, dynamic>) return v;
+      if (v is Map) return v.cast<String, dynamic>();
+    } catch (_) {}
+    return null;
+  }
+
+  bool _rxLooksLikeFileRef(String s) {
+    final v = s.trim();
+    if (v.isEmpty) return false;
+    if ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']'))) {
+      return false;
+    }
+    final lower = v.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://')) return true;
+    if (lower.contains('/uploads/') || lower.startsWith('uploads/')) return true;
+    if (lower.endsWith('.pdf')) return true;
+    if (_isImage(lower)) return true;
+    return false;
+  }
+
+  String _rxApptTitleFromCache(int apptId) {
+    final appt = _apptCache[apptId];
+    if (appt == null) return 'Appointment #$apptId';
+
+    final title = (appt['title'] ?? appt['reason'] ?? appt['name'] ?? '').toString().trim();
+    if (title.isNotEmpty) return title;
+
+    final d = (appt['doctor'] as Map?) ?? const {};
+    final docName = (d['name'] ?? '').toString().trim();
+    if (docName.isNotEmpty) return 'Appointment #$apptId · $docName';
+
+    return 'Appointment #$apptId';
+  }
+
+  Future<String> _rxEnsureApptTitle(int apptId) async {
+    if (_apptCache.containsKey(apptId)) return _rxApptTitleFromCache(apptId);
+
+    try {
+      final detail = await Api.get('/appointments/$apptId');
+      if (detail is Map) {
+        _apptCache[apptId] = detail.cast<String, dynamic>();
+        return _rxApptTitleFromCache(apptId);
+      }
+    } catch (_) {}
+
+    return 'Appointment #$apptId';
+  }
+
+  Future<String?> _rxReadToken() async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      const keys = <String>[
+        'token',
+        'access_token',
+        'accessToken',
+        'auth_token',
+        'authToken',
+        'jwt',
+        'bearer',
+      ];
+      for (final k in keys) {
+        final v = sp.getString(k);
+        if (v != null && v.trim().isNotEmpty) return v.trim();
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _rxSaveBytes(Uint8List bytes, String filename) async {
+    String mime = 'application/octet-stream';
+    final lower = filename.toLowerCase();
+    if (lower.endsWith('.pdf')) mime = 'application/pdf';
+    if (lower.endsWith('.png')) mime = 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) mime = 'image/jpeg';
+
+    if (!kIsWeb && _isMobile) {
+      await Share.shareXFiles(
+        [XFile.fromData(bytes, name: filename, mimeType: mime)],
+        text: filename,
+      );
+      showSnack(context, 'Choose a location to save $filename');
+      return;
+    }
+
+    try {
+      await FileSaver.instance.saveFile(name: filename, bytes: bytes);
+      showSnack(context, 'Saved $filename');
+    } catch (_) {
+      showSnack(context, 'Could not save file.');
+    }
+  }
+
+  Future<void> _rxDownloadAuth(String url, {required String filename}) async {
+    final token = await _rxReadToken();
+    if (token == null || token.isEmpty) {
+      showSnack(context, 'Login required (token missing).');
+      return;
+    }
+
+    try {
+      final dio = Dio();
+      final resp = await dio.get<List<int>>(
+        url,
+        options: Options(
+          responseType: ResponseType.bytes,
+          followRedirects: true,
+          headers: {
+            'Authorization': 'Bearer $token',
+          },
+        ),
+      );
+
+      final data = resp.data ?? const <int>[];
+      if (data.isEmpty) throw 'Empty response';
+
+      await _rxSaveBytes(Uint8List.fromList(data), filename);
+    } catch (e) {
+      showSnack(context, 'Download failed: $e');
+    }
+  }
+
+  Widget _rxThumb({
+    required bool hasFile,
+    required String fileRefRaw,
+    required String url,
+    required bool hasText,
+  }) {
+    if (!hasFile) {
+      return Icon(hasText ? Icons.receipt_long : Icons.description, size: 52);
+    }
+
+    final isImg = _isImage(fileRefRaw);
+    if (!isImg) return const Icon(Icons.description, size: 52);
+
+    return Image.network(
+      url,
+      fit: BoxFit.cover,
+      gaplessPlayback: true,
+      errorBuilder: (_, __, ___) => const Icon(Icons.broken_image, size: 52),
+    );
+  }
+
+  Future<void> _rxOpenTextPreview({
+    required String title,
+    required String contentStr,
+  }) async {
+    final payload = _tryJsonMap(contentStr) ?? <String, dynamic>{'content': contentStr};
+
+    await showDialog<void>(
+      context: context,
+      builder: (_) => Dialog(
+        insetPadding: const EdgeInsets.all(16),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: _RxPadPreview(
+            payload: payload,
+            patient: null,
+            doctor: null,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _rxOpenSelectSheet({
+    required String title,
+    required int apptId,
+    required bool hasText,
+    required bool hasFile,
+    required String contentStr,
+    required String fileRefRaw,
+  }) async {
+    final fileUrl = hasFile ? _fileUrlFromPath(fileRefRaw) : '';
+
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+              subtitle: Text('Appointment #$apptId'),
+            ),
+            const Divider(height: 0),
+            if (hasText)
+              ListTile(
+                leading: const Icon(Icons.notes),
+                title: const Text('View Text Prescription'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await _rxOpenTextPreview(title: title, contentStr: contentStr);
+                },
+              ),
+            if (hasFile)
+              ListTile(
+                leading: const Icon(Icons.picture_as_pdf),
+                title: const Text('View File Prescription'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showDocLightbox(context, title: title, url: fileUrl);
+                },
+              ),
+            if (hasText)
+              ListTile(
+                leading: const Icon(Icons.download),
+                title: const Text('Download Text (PDF)'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final safe = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+                  final pdfUrl = '${Api.baseUrl}/appointments/$apptId/prescription/pdf';
+                  await _rxDownloadAuth(pdfUrl, filename: '$safe.pdf');
+                },
+              ),
+            if (hasFile)
+              ListTile(
+                leading: const Icon(Icons.download),
+                title: const Text('Download File'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final safe = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+                  final lower = fileRefRaw.toLowerCase();
+                  final ext = lower.endsWith('.png')
+                      ? 'png'
+                      : (lower.endsWith('.jpg') || lower.endsWith('.jpeg'))
+                          ? 'jpg'
+                          : lower.endsWith('.pdf')
+                              ? 'pdf'
+                              : 'pdf';
+                  await _rxDownloadAuth(fileUrl, filename: '$safe.$ext');
+                },
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _rxOpenPrescriptionCard(Map<String, dynamic> p) async {
+    final apptId = _coerceInt(p['appointment_id']);
+    final rawFileRef = (p['file_url'] ?? p['file_path'] ?? '').toString();
+    final contentStr = (p['content'] ?? '').toString();
+
+    final hasFile = _rxLooksLikeFileRef(rawFileRef);
+    final hasText = contentStr.trim().isNotEmpty;
+
+    if (apptId == null) {
+      if (hasFile) {
+        showDocLightbox(context, title: 'Prescription', url: _fileUrlFromPath(rawFileRef));
+        return;
+      }
+      if (hasText) {
+        await _rxOpenTextPreview(title: 'Prescription', contentStr: contentStr);
+        return;
+      }
+      showSnack(context, 'No prescription data found.');
+      return;
+    }
+
+    final title = await _rxEnsureApptTitle(apptId);
+
+    if (hasFile && hasText) {
+      await _rxOpenSelectSheet(
+        title: title,
+        apptId: apptId,
+        hasText: true,
+        hasFile: true,
+        contentStr: contentStr,
+        fileRefRaw: rawFileRef,
+      );
+      return;
+    }
+
+    if (hasFile) {
+      showDocLightbox(context, title: title, url: _fileUrlFromPath(rawFileRef));
+      return;
+    }
+
+    if (hasText) {
+      await _rxOpenTextPreview(title: title, contentStr: contentStr);
+      return;
+    }
+
+    showSnack(context, 'No prescription data found.');
+  }
+
+  Future<void> _rxDownloadPrescriptionCard(Map<String, dynamic> p) async {
+    final apptId = _coerceInt(p['appointment_id']);
+    final rawFileRef = (p['file_url'] ?? p['file_path'] ?? '').toString();
+    final contentStr = (p['content'] ?? '').toString();
+
+    final hasFile = _rxLooksLikeFileRef(rawFileRef);
+    final hasText = contentStr.trim().isNotEmpty;
+
+    if (apptId == null) {
+      if (hasFile) {
+        await _rxDownloadAuth(_fileUrlFromPath(rawFileRef), filename: 'Prescription.pdf');
+        return;
+      }
+      showSnack(context, 'Missing appointment id');
+      return;
+    }
+
+    final title = await _rxEnsureApptTitle(apptId);
+    final safe = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+
+    if (hasFile && hasText) {
+      await _rxOpenSelectSheet(
+        title: title,
+        apptId: apptId,
+        hasText: true,
+        hasFile: true,
+        contentStr: contentStr,
+        fileRefRaw: rawFileRef,
+      );
+      return;
+    }
+
+    if (hasFile) {
+      final fileUrl = _fileUrlFromPath(rawFileRef);
+      final lower = rawFileRef.toLowerCase();
+      final ext = lower.endsWith('.png')
+          ? 'png'
+          : (lower.endsWith('.jpg') || lower.endsWith('.jpeg'))
+              ? 'jpg'
+              : lower.endsWith('.pdf')
+                  ? 'pdf'
+                  : 'pdf';
+      await _rxDownloadAuth(fileUrl, filename: '$safe.$ext');
+      return;
+    }
+
+    if (hasText) {
+      final pdfUrl = '${Api.baseUrl}/appointments/$apptId/prescription/pdf';
+      await _rxDownloadAuth(pdfUrl, filename: '$safe.pdf');
+      return;
+    }
+
+    showSnack(context, 'No prescription to download.');
+  }
+
   @override
   Widget build(BuildContext context) {
     if (loading) return const Center(child: CircularProgressIndicator());
@@ -4723,7 +5390,6 @@ bool _kIsWeb() => kIsWeb;
     );
   }
 
-  // ----------------------------- grids (builder = faster) -----------------------------
   Widget _reportsGrid() {
     if (reports.isEmpty) {
       return const Center(child: Text('No reports yet.'));
@@ -4744,12 +5410,13 @@ bool _kIsWeb() => kIsWeb;
         final filePath = (r['file_path'] ?? '').toString();
         final url = _fileUrlFromPath(filePath);
         final isImg = _isImage(filePath);
+
         final preview = isImg
             ? Image.network(url, fit: BoxFit.cover, gaplessPlayback: true)
             : const Icon(Icons.insert_drive_file, size: 48);
 
         final rid = _coerceInt(r['id'])!;
-        final apptId = _coerceInt(r['appointment_id']); // may be null (ok)
+        final apptId = _coerceInt(r['appointment_id']);
         final createdText = _whenStr(_parseDt(r['uploaded_at']));
 
         final cardBody = Card(
@@ -4784,10 +5451,12 @@ bool _kIsWeb() => kIsWeb;
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w600)),
+                      Text(
+                        name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
                       const SizedBox(height: 4),
                       Row(
                         children: [
@@ -4798,6 +5467,7 @@ bool _kIsWeb() => kIsWeb;
                               createdText,
                               style: Theme.of(context).textTheme.bodySmall,
                               overflow: TextOverflow.ellipsis,
+                              maxLines: 1,
                             ),
                           ),
                         ],
@@ -4835,7 +5505,6 @@ bool _kIsWeb() => kIsWeb;
           ),
         );
 
-        // Tooltips only on non-mobile (doctor/appointment fetched lazily when opening sheet)
         return _isMobile ? cardBody : Tooltip(message: 'Created: $createdText', child: cardBody);
       },
     );
@@ -4846,72 +5515,108 @@ bool _kIsWeb() => kIsWeb;
       return const Center(child: Text('No prescriptions yet.'));
     }
 
+    final isPhone = _isMobile;
+    final maxExtent = isPhone ? 220.0 : 280.0;
+    final aspect = isPhone ? 0.68 : 0.78;
+
+    Widget compactIconButton({
+      required String tooltip,
+      required IconData icon,
+      Color? color,
+      required VoidCallback onPressed,
+    }) {
+      return IconButton(
+        tooltip: tooltip,
+        onPressed: onPressed,
+        icon: Icon(icon, size: 20, color: color),
+        padding: EdgeInsets.zero,
+        visualDensity: VisualDensity.compact,
+        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+      );
+    }
+
     return GridView.builder(
       padding: const EdgeInsets.all(12),
       gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: _isMobile ? 240 : 280,
+        maxCrossAxisExtent: maxExtent,
         mainAxisSpacing: 12,
         crossAxisSpacing: 12,
-        childAspectRatio: 0.78,
+        childAspectRatio: aspect,
       ),
       itemCount: prescriptions.length,
       itemBuilder: (ctx, i) {
         final p = prescriptions[i];
-        final apptId = _coerceInt(p['appointment_id']) ?? 0;
-        final createdText = _whenStr(_parseDt(p['created_at']));
-        final fileUrl = (p['file_url'] ?? p['file_path'] ?? '') as String;
-        final content = (p['content'] ?? '') as String;
-        final hasFile = fileUrl.toString().isNotEmpty;
-        final url = hasFile ? _fileUrlFromPath(fileUrl) : '';
-        final isImg = hasFile && _isImage(fileUrl);
-        final title = hasFile ? fileUrl.split('/').last : 'Prescription';
-        final preview = hasFile
-            ? (isImg
-                ? Image.network(url, fit: BoxFit.cover, gaplessPlayback: true)
-                : const Icon(Icons.description, size: 48))
-            : const Icon(Icons.description, size: 48);
 
-        final cardBody = Card(
+        final apptId = _coerceInt(p['appointment_id']);
+        final createdText = _whenStr(_parseDt(p['created_at']));
+
+        final rawFileRef = (p['file_url'] ?? p['file_path'] ?? '').toString();
+        final contentStr = (p['content'] ?? '').toString();
+
+        final hasFile = _rxLooksLikeFileRef(rawFileRef);
+        final hasText = contentStr.trim().isNotEmpty;
+
+        final title = apptId == null ? 'Prescription' : _rxApptTitleFromCache(apptId);
+
+        final url = hasFile ? _fileUrlFromPath(rawFileRef) : '';
+        final thumb = _rxThumb(hasFile: hasFile, fileRefRaw: rawFileRef, url: url, hasText: hasText);
+
+        Future<void> openAction() => _rxOpenPrescriptionCard(p);
+        Future<void> downloadAction() => _rxDownloadPrescriptionCard(p);
+
+        Future<void> deleteAction() async {
+          if (apptId == null) {
+            showSnack(context, 'Missing appointment id');
+            return;
+          }
+          final ok = await _confirm(
+            title: 'Delete prescription?',
+            message: 'This will remove the prescription for this appointment.',
+          );
+          if (ok) await _deletePrescription(apptId);
+        }
+
+        final typeLine = hasFile && hasText
+            ? 'Text + File'
+            : hasFile
+                ? 'File'
+                : hasText
+                    ? 'Text'
+                    : '';
+
+        final card = Card(
           clipBehavior: Clip.antiAlias,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           elevation: 1,
-          child: InkWell(
-            onTap: hasFile ? () => showDocLightbox(context, title: title, url: url) : null,
-            onLongPress: _isMobile
-                ? () => _openActionsMobile(
-                      title: title,
-                      createdAt: createdText,
-                      appointmentId: apptId,
-                      doctorName: _doctorForAppt(apptId),
-                      onOpen: hasFile ? () => showDocLightbox(context, title: title, url: url) : null,
-                      onDownload: hasFile ? () => _downloadUrl(url) : null,
-                      onDeleteConfirmed: () async {
-                        final ok = await _confirm(
-                          title: 'Delete prescription?',
-                          message: 'This will remove the prescription for this appointment.',
-                        );
-                        if (ok) await _deletePrescription(apptId);
-                      },
-                    )
-                : null,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                AspectRatio(aspectRatio: 4 / 3, child: Center(child: preview)),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              AspectRatio(
+                aspectRatio: isPhone ? (16 / 11) : (4 / 3),
+                child: ClipRect(
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      if (hasFile && _isImage(rawFileRef))
+                        Positioned.fill(child: thumb)
+                      else
+                        Center(child: thumb),
+                    ],
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w600)),
-                      if (content.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Text(content, maxLines: 2, overflow: TextOverflow.ellipsis),
-                        ),
+                      Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
                       const SizedBox(height: 4),
                       Row(
                         children: [
@@ -4922,44 +5627,68 @@ bool _kIsWeb() => kIsWeb;
                               createdText,
                               style: Theme.of(context).textTheme.bodySmall,
                               overflow: TextOverflow.ellipsis,
+                              maxLines: 1,
                             ),
+                          ),
+                        ],
+                      ),
+                      if (typeLine.isNotEmpty) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          typeLine,
+                          style: Theme.of(context).textTheme.bodySmall,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                      const Spacer(),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          compactIconButton(
+                            tooltip: 'Download',
+                            icon: Icons.download,
+                            onPressed: () => downloadAction(),
+                          ),
+                          compactIconButton(
+                            tooltip: 'Delete',
+                            icon: Icons.delete,
+                            color: Colors.red,
+                            onPressed: () => deleteAction(),
                           ),
                         ],
                       ),
                     ],
                   ),
                 ),
-                if (!_isMobile)
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        IconButton(
-                          tooltip: 'Download',
-                          onPressed: hasFile ? () => _downloadUrl(url) : null,
-                          icon: const Icon(Icons.download),
-                        ),
-                        IconButton(
-                          tooltip: 'Delete',
-                          onPressed: () async {
-                            final ok = await _confirm(
-                              title: 'Delete prescription?',
-                              message: 'This will remove the prescription for this appointment.',
-                            );
-                            if (ok) await _deletePrescription(apptId);
-                          },
-                          icon: const Icon(Icons.delete, color: Colors.red),
-                        ),
-                      ],
-                    ),
-                  ),
-              ],
-            ),
+              ),
+            ],
           ),
         );
 
-        return _isMobile ? cardBody : Tooltip(message: 'Created: $createdText', child: cardBody);
+        final tappable = InkWell(
+          onTap: () => openAction(),
+          onLongPress: _isMobile
+              ? () => _openActionsMobile(
+                    title: title,
+                    createdAt: createdText,
+                    appointmentId: apptId,
+                    doctorName: _doctorForAppt(apptId),
+                    onOpen: () => openAction(),
+                    onDownload: () => downloadAction(),
+                    onDeleteConfirmed: () async => deleteAction(),
+                  )
+              : null,
+          child: card,
+        );
+
+        if (apptId != null && !_apptCache.containsKey(apptId)) {
+          _rxEnsureApptTitle(apptId).then((_) {
+            if (mounted) setState(() {});
+          });
+        }
+
+        return _isMobile ? tappable : Tooltip(message: 'Created: $createdText', child: tappable);
       },
     );
   }

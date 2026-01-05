@@ -78,13 +78,19 @@ class Doctor {
   final String keywords;
   final String bio;
   final String background;
-  final int rating;            // keep int for backwards-compat
+  final int rating;
   final String? photoPath;
 
   // Optional fields often added later
   final String? phone;
   final String? address;
   final double? visitingFee;
+
+  // NEW (from /doctors/browse)
+  final DateTime? nextOnline;
+  final DateTime? nextOffline;
+  final bool hasOnline;
+  final bool hasOffline;
 
   Doctor({
     required this.id,
@@ -100,39 +106,47 @@ class Doctor {
     this.phone,
     this.address,
     this.visitingFee,
+
+    // NEW
+    this.nextOnline,
+    this.nextOffline,
+    this.hasOnline = false,
+    this.hasOffline = false,
   });
 
-  factory Doctor.fromJson(Map<String, dynamic> j) => Doctor(
-        id: _asInt(j['id'] ?? j['doctor_id']),
-        name: _asString(j['name']),
-        email: _asStringN(j['email']),
-        specialty: _asString(j['specialty']),
-        category: _asString(j['category'], fallback: 'General'),
-        keywords: _asString(j['keywords']),
-        bio: _asString(j['bio']),
-        background: _asString(j['background']),
-        rating: _asInt(j['rating']),
-        photoPath: _asStringN(j['photo_path'] ?? j['photo']),
-        phone: _asStringN(j['phone']),
-        address: _asStringN(j['address']),
-        visitingFee: _asDoubleN(j['visiting_fee'] ?? j['visitingFee'] ?? j['fee']),
-      );
+  static DateTime? _asDtN(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v;
+    final s = v.toString().trim();
+    if (s.isEmpty || s.toLowerCase() == 'null') return null;
+    return DateTime.tryParse(s);
+  }
 
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'email': email,
-        'specialty': specialty,
-        'category': category,
-        'keywords': keywords,
-        'bio': bio,
-        'background': background,
-        'rating': rating,
-        'photo_path': photoPath,
-        'phone': phone,
-        'address': address,
-        'visiting_fee': visitingFee,
-      };
+  factory Doctor.fromJson(Map<String, dynamic> j) {
+    DateTime? parseDate(String? s) {
+      if (s == null || s.isEmpty) return null;
+      return DateTime.tryParse(s);
+    }
+
+    return Doctor(
+      id: j['id'],
+      name: j['name'] ?? '',
+      specialty: j['specialty'] ?? '',
+      category: j['category'] ?? '',
+      keywords: j['keywords'] ?? '',
+      bio: j['bio'] ?? '',
+      background: j['background'] ?? '',
+      rating: (j['rating'] ?? 0).toInt(),
+      photoPath: j['photo_path'],
+
+      // ✅ NEW (from /doctors/browse)
+      nextOnline: parseDate(j['next_online']),
+      nextOffline: parseDate(j['next_offline']),
+      hasOnline: j['has_online'] == true,
+      hasOffline: j['has_offline'] == true,
+    );
+  }
+
 }
 
 // ───────────────────────── Appointment ─────────────────────────
