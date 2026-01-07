@@ -1,6 +1,7 @@
 // lib/screens/admin/dashboard.dart
 import 'dart:typed_data';
-
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:dio/dio.dart' as dio_pkg;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -17,6 +18,7 @@ import '../../services/api.dart';
 import '../../services/auth.dart';
 import '../../utils/download.dart';
 import '../../widgets/snack.dart';
+
 
 /// ───────────────────────────── Shared helpers ─────────────────────────────
 
@@ -1562,14 +1564,18 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
                       onPressed: () {
                         Navigator.of(context).push(
                           MaterialPageRoute(
-                            builder: (_) =>
-                                DoctorAvailabilityPage(doctorId: widget.doctorId),
+                            builder: (_) => DoctorAvailabilityAndAppointmentsPage(
+                              doctorId: widget.doctorId,
+                              doctorName: name.isNotEmpty ? name : "Doctor #${widget.doctorId}",
+                              visitingFee: null, // if you have fee put it here
+                            ),
                           ),
                         );
                       },
                       icon: const Icon(Icons.event_available),
                       label: const Text('Availability & Appointments'),
                     ),
+
                   ],
                 ),
               ],
@@ -1578,14 +1584,434 @@ class _DoctorDetailPageState extends State<DoctorDetailPage> {
   }
 }
 
+
+// -----------------------------------------------------------------------------
+// DoctorScheduleTimelineView
+// - 7 day date window navigator (← / →)
+// - Toggle: Availability / Appointments
+// - Filter: All / Online / Offline
+// - Appointment list cards like your screenshot
+// -----------------------------------------------------------------------------
+
+class DoctorScheduleTimelineView extends StatefulWidget {
+  const DoctorScheduleTimelineView({
+    super.key,
+    required this.doctorId,
+    required this.doctorName,
+  });
+
+  final int doctorId;
+  final String doctorName;
+
+  @override
+  State<DoctorScheduleTimelineView> createState() =>
+      _DoctorScheduleTimelineViewState();
+}
+
+class _DoctorScheduleTimelineViewState extends State<DoctorScheduleTimelineView> {
+  final dfDay = DateFormat('MMM d, yyyy');
+  final dfTime = DateFormat('h:mm a');
+
+  // 7-day window
+  late DateTime windowStart; // local date start
+  late DateTime windowEnd; // local date end
+
+  bool loading = false;
+
+  // Tabs
+  int tabIndex = 1; // 0 availability, 1 appointments (as screenshot)
+  String modeFilter = 'all'; // all/online/offline
+
+  // Appointments
+  List<Map<String, dynamic>> appts = [];
+
+  @override
+  void initState() {
+    super.initState();
+
+    final now = DateTime.now();
+    windowStart = DateTime(now.year, now.month, now.day);
+    windowEnd = windowStart.add(const Duration(days: 6));
+
+    _load();
+  }
+
+  DateTime? _parseDate(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v;
+    if (v is String) return DateTime.tryParse(v);
+    if (v is int) {
+      if (v < 10000000000) return DateTime.fromMillisecondsSinceEpoch(v * 1000);
+      return DateTime.fromMillisecondsSinceEpoch(v);
+    }
+    if (v is double) {
+      final n = v.toInt();
+      if (n < 10000000000) return DateTime.fromMillisecondsSinceEpoch(n * 1000);
+      return DateTime.fromMillisecondsSinceEpoch(n);
+    }
+    return null;
+  }
+
+  String _modeLabel(dynamic visitMode) {
+    final m = (visitMode ?? '').toString().toLowerCase();
+    if (m.contains('online')) return 'Online';
+    return 'Offline';
+  }
+
+  IconData _modeIcon(dynamic visitMode) {
+    final m = (visitMode ?? '').toString().toLowerCase();
+    if (m.contains('online')) return Icons.wifi;
+    return Icons.store_mall_directory_outlined;
+  }
+
+  Color _chipBg(String t) {
+    final s = t.toLowerCase();
+    if (s.contains('requested') || s.contains('pending')) return Colors.green.withOpacity(.12);
+    if (s.contains('approved') || s.contains('paid')) return Colors.green.withOpacity(.12);
+    if (s.contains('cancel') || s.contains('reject')) return Colors.red.withOpacity(.12);
+    return Colors.grey.withOpacity(.15);
+  }
+
+  Color _chipFg(String t) {
+    final s = t.toLowerCase();
+    if (s.contains('requested') || s.contains('pending')) return Colors.green.shade900;
+    if (s.contains('approved') || s.contains('paid')) return Colors.green.shade900;
+    if (s.contains('cancel') || s.contains('reject')) return Colors.red.shade800;
+    return Colors.grey.shade900;
+  }
+
+  Widget _pill(String text, {Color? bg, Color? fg, IconData? icon}) {
+    final b = bg ?? Colors.grey.withOpacity(.15);
+    final f = fg ?? Colors.grey.shade900;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: b,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 15, color: f),
+            const SizedBox(width: 6),
+          ],
+          Text(
+            text,
+            style: TextStyle(fontWeight: FontWeight.w700, color: f, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _load() async {
+    setState(() => loading = true);
+
+    try {
+      // Load appointments from admin endpoint then filter for this doctor + date range
+      final res = await Api.get('/admin/appointments');
+      final list = (res as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+
+      final start = DateTime(windowStart.year, windowStart.month, windowStart.day);
+      final end = DateTime(windowEnd.year, windowEnd.month, windowEnd.day, 23, 59, 59);
+
+      final filtered = list.where((a) {
+        final did = a['doctor_id'] ?? a['doctorId'];
+        final docId = (did is num) ? did.toInt() : int.tryParse('$did') ?? -1;
+        if (docId != widget.doctorId) return false;
+
+        final st = _parseDate(a['start_time']);
+        if (st == null) return false;
+
+        final local = st.toLocal();
+        if (local.isBefore(start) || local.isAfter(end)) return false;
+
+        // mode filter
+        final vm = (a['visit_mode'] ?? a['visitMode'] ?? '').toString().toLowerCase();
+        if (modeFilter == 'online' && !vm.contains('online')) return false;
+        if (modeFilter == 'offline' && vm.contains('online')) return false;
+
+        return true;
+      }).toList();
+
+      // sort by start time ascending (like a timeline)
+      filtered.sort((a, b) {
+        final sa = _parseDate(a['start_time']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final sb = _parseDate(b['start_time']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return sa.compareTo(sb);
+      });
+
+      appts = filtered;
+    } catch (e) {
+      appts = [];
+      if (mounted) showSnack(context, 'Load failed: $e');
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  void _shiftWindow(int days) {
+    setState(() {
+      windowStart = windowStart.add(Duration(days: days));
+      windowEnd = windowStart.add(const Duration(days: 6));
+    });
+    _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rangeLabel = '${dfDay.format(windowStart)}  →  ${dfDay.format(windowEnd)}';
+
+    return Column(
+      children: [
+        // HEADER BAR (range + arrows)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: 'Previous',
+                onPressed: loading ? null : () => _shiftWindow(-7),
+                icon: const Icon(Icons.chevron_left),
+              ),
+              Expanded(
+                child: Center(
+                  child: Text(
+                    rangeLabel,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Next',
+                onPressed: loading ? null : () => _shiftWindow(7),
+                icon: const Icon(Icons.chevron_right),
+              ),
+            ],
+          ),
+        ),
+
+        // TAB SWITCH: Availability / Appointments
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: SegmentedButton<int>(
+            segments: const [
+              ButtonSegment(value: 0, label: Text('Availability'), icon: Icon(Icons.calendar_today)),
+              ButtonSegment(value: 1, label: Text('Appointments'), icon: Icon(Icons.check_circle)),
+            ],
+            selected: {tabIndex},
+            onSelectionChanged: (s) {
+              setState(() => tabIndex = s.first);
+              // if you later load availability, call _loadAvailability()
+            },
+          ),
+        ),
+
+        // MODE FILTER (All / Online / Offline)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'all', label: Text('All')),
+              ButtonSegment(value: 'online', label: Text('Online')),
+              ButtonSegment(value: 'offline', label: Text('Offline')),
+            ],
+            selected: {modeFilter},
+            onSelectionChanged: (s) {
+              setState(() => modeFilter = s.first);
+              _load();
+            },
+          ),
+        ),
+
+        if (loading) const LinearProgressIndicator(),
+
+        Expanded(
+          child: tabIndex == 0
+              ? _availabilityPlaceholder()
+              : _appointmentsList(),
+        ),
+      ],
+    );
+  }
+
+  Widget _availabilityPlaceholder() {
+    // You already have availability screen logic.
+    // This placeholder is here because you asked ONLY for this appointment feature view.
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      children: const [
+        SizedBox(height: 40),
+        Center(
+          child: Text(
+            'Availability view can be shown here (your existing availability UI).',
+            style: TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _appointmentsList() {
+    if (!loading && appts.isEmpty) {
+      return ListView(
+        padding: const EdgeInsets.all(20),
+        children: const [
+          SizedBox(height: 120),
+          Center(child: Text('No appointments found')),
+        ],
+      );
+    }
+
+    return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+      itemCount: appts.length,
+      itemBuilder: (ctx, i) {
+        final a = appts[i];
+
+        final idDyn = a['id'];
+        final apptId = (idDyn is num) ? idDyn.toInt() : int.tryParse('$idDyn') ?? 0;
+
+        final st = _parseDate(a['start_time'])?.toLocal();
+        final en = _parseDate(a['end_time'])?.toLocal();
+
+        final when = [
+          if (st != null) '${dfDay.format(st)} ${dfTime.format(st)}',
+          if (en != null) '→ ${dfDay.format(en)} ${dfTime.format(en)}',
+        ].join('  ');
+
+        final status = (a['status'] ?? '').toString();
+        final payment = (a['payment_status'] ?? '').toString();
+        final mode = _modeLabel(a['visit_mode'] ?? a['visitMode']);
+        final modeIcon = _modeIcon(a['visit_mode'] ?? a['visitMode']);
+
+        return Card(
+          elevation: 0,
+          color: Colors.grey.withOpacity(.06),
+          margin: const EdgeInsets.symmetric(vertical: 6),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: apptId <= 0
+                ? null
+                : () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => AppointmentDetailPage(apptId: apptId)),
+                    );
+                  },
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Appointment #$apptId',
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    when,
+                    style: TextStyle(color: Colors.grey.shade800),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      _pill(mode, icon: modeIcon),
+                      _pill('Status: $status',
+                          bg: _chipBg(status), fg: _chipFg(status)),
+                      _pill('Payment: $payment',
+                          bg: Colors.blue.withOpacity(.12),
+                          fg: Colors.blue.shade800),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+class DoctorAvailabilityAndAppointmentsPage extends StatefulWidget {
+  const DoctorAvailabilityAndAppointmentsPage({
+    super.key,
+    required this.doctorId,
+    required this.doctorName,
+    this.visitingFee,
+  });
+
+  final int doctorId;
+  final String doctorName;
+  final double? visitingFee;
+
+  @override
+  State<DoctorAvailabilityAndAppointmentsPage> createState() =>
+      _DoctorAvailabilityAndAppointmentsPageState();
+}
+
+class _DoctorAvailabilityAndAppointmentsPageState
+    extends State<DoctorAvailabilityAndAppointmentsPage> {
+  int tabIndex = 0; // 0 availability, 1 appointments
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("Dr. ${widget.doctorName}"),
+      ),
+      body: Column(
+        children: [
+          const SizedBox(height: 10),
+
+          //    toggle
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: SegmentedButton<int>(
+              segments: const [
+                ButtonSegment(
+                  value: 0,
+                  icon: Icon(Icons.calendar_today),
+                  label: Text("Availability"),
+                ),
+                ButtonSegment(
+                  value: 1,
+                  icon: Icon(Icons.check_circle),
+                  label: Text("Appointments"),
+                ),
+              ],
+              selected: {tabIndex},
+              onSelectionChanged: (s) => setState(() => tabIndex = s.first),
+            ),
+          ),
+
+          const SizedBox(height: 10),
+
+          //    ONLY ONE Expanded
+          Expanded(
+            child: tabIndex == 0
+                ? DoctorAvailabilityBody(
+                    doctorId: widget.doctorId,
+                    doctorName: widget.doctorName,
+                    visitingFee: widget.visitingFee,
+                  )
+                : DoctorScheduleAppointmentsBody(
+                    doctorId: widget.doctorId,
+                    doctorName: widget.doctorName,
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
 /// ─────────────────────────── TOP-LEVEL typed slot model (FIX) ───────────────────────────
 
-class _BlockSlot {
-  final DateTime start;
-  final DateTime end;
-  final String mode; // online/offline/...
-  const _BlockSlot({required this.start, required this.end, required this.mode});
-}
 
 String _modeOf(dynamic row) {
   final m = (row is Map) ? row : <String, dynamic>{};
@@ -1639,456 +2065,1556 @@ DateTime? _parseBlockTime(String raw, DateTime day) {
   return null;
 }
 
-/// ─────────────────────────── Doctor Availability ───────────────────────────
+// ===================== DoctorAvailabilityPage + CreateAppointmentPage =====================
 
 class DoctorAvailabilityPage extends StatefulWidget {
-  const DoctorAvailabilityPage({super.key, required this.doctorId});
   final int doctorId;
+  final String doctorName;
+  final double? visitingFee;
+
+  const DoctorAvailabilityPage({
+    super.key,
+    required this.doctorId,
+    required this.doctorName,
+    this.visitingFee,
+  });
 
   @override
   State<DoctorAvailabilityPage> createState() => _DoctorAvailabilityPageState();
 }
 
 class _DoctorAvailabilityPageState extends State<DoctorAvailabilityPage> {
-  final dfDate = DateFormat.yMMMd();
-  final dfTime = DateFormat.jm();
+  bool loading = false;
 
-  bool loading = true;
-  bool loadingWeek = true;
+  // 7-day window start
+  DateTime weekStart = DateTime.now();
 
-  late DateTime _from;
-  late DateTime _to;
+  // filter: all / online / offline
+  String modeFilter = "all";
 
-  // day -> list of blocks (typed)
-  final Map<DateTime, List<_BlockSlot>> _slotsByDay = {};
-
-  List<Map<String, dynamic>> _appts = [];
-
-  int _tabIndex = 0; // 0 availability, 1 appointments
-  String _modeFilter = 'all'; // all / online / offline
+  // Map<dayKey, blocks>
+  final Map<String, List<Map<String, dynamic>>> blocksByDay = {};
 
   @override
   void initState() {
     super.initState();
-    _initWeek(DateTime.now());
-    _load();
+    weekStart = DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day);
+    _loadWeek();
   }
 
-  void _initWeek(DateTime anchor) {
-    final start = DateTime(anchor.year, anchor.month, anchor.day);
-    _from = start;
-    _to = start.add(const Duration(days: 7));
+  String _dayKey(DateTime d) =>
+      "${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}";
+
+  List<DateTime> _daysOfWeek() {
+    return List.generate(7, (i) {
+      final d = weekStart.add(Duration(days: i));
+      return DateTime(d.year, d.month, d.day);
+    });
   }
 
-  Future<void> _load() async {
+  Future<void> _loadWeek() async {
     setState(() {
       loading = true;
-      loadingWeek = true;
-      _slotsByDay.clear();
-      _appts = [];
+      blocksByDay.clear();
     });
-    await Future.wait([_loadAvailability(), _loadAppointments()]);
-    if (mounted) {
-      setState(() {
-        loading = false;
-        loadingWeek = false;
-      });
-    }
-  }
 
-  Future<void> _loadAvailability() async {
-    final id = widget.doctorId;
+    final days = _daysOfWeek();
 
-    _slotsByDay.clear();
+    try {
+      // Load each day blocks
+      for (final d in days) {
+        final key = _dayKey(d);
 
-    DateTime day = DateTime(_from.year, _from.month, _from.day);
-    final last =
-        DateTime(_to.year, _to.month, _to.day).subtract(const Duration(days: 1));
+        // If filter is "all", load both modes and merge.
+        if (modeFilter == "all") {
+          final online = await _fetchBlocksForDay(key, "online");
+          final offline = await _fetchBlocksForDay(key, "offline");
+          final merged = [...online, ...offline];
 
-    while (!day.isAfter(last)) {
-      final dayKey =
-          '${day.year.toString().padLeft(4, '0')}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}';
+          // sort by start
+          merged.sort((a, b) {
+            final sa = DateTime.tryParse("${a["start"]}") ?? DateTime(1970);
+            final sb = DateTime.tryParse("${b["start"]}") ?? DateTime(1970);
+            return sa.compareTo(sb);
+          });
 
-      try {
-        final res = await Api.get(
-          '/doctors/$id/blocks',
-          query: {
-            'day': dayKey,
-            if (_modeFilter != 'all') 'visit_mode': _modeFilter,
-          },
-        );
-
-        if (res is List && res.isNotEmpty) {
-          final key = DateTime(day.year, day.month, day.day);
-
-          for (final row in res) {
-            final m = row is Map ? Map<String, dynamic>.from(row) : <String, dynamic>{};
-
-            final startRaw =
-                (m['start'] ?? m['time_from'] ?? m['from'] ?? '').toString();
-            final endRaw =
-                (m['end'] ?? m['time_to'] ?? m['to'] ?? '').toString();
-
-            final st = _parseBlockTime(startRaw, key);
-            final en = _parseBlockTime(endRaw, key);
-
-            if (st != null && en != null) {
-              (_slotsByDay[key] ??= []).add(
-                _BlockSlot(start: st, end: en, mode: _modeOf(m)),
-              );
-            }
-          }
-
-          _slotsByDay[key]!.sort((a, b) => a.start.compareTo(b.start));
+          blocksByDay[key] = merged;
+        } else {
+          final list = await _fetchBlocksForDay(key, modeFilter);
+          blocksByDay[key] = list;
         }
-      } catch (_) {}
+      }
+    } catch (e) {
+      if (mounted) showSnack(context, "Failed to load availability: $e");
+    }
 
-      day = day.add(const Duration(days: 1));
+    if (mounted) {
+      setState(() => loading = false);
     }
   }
 
-  Future<void> _loadAppointments() async {
-    final id = widget.doctorId;
-    final urls = <String>[
-      '/admin/appointments',
-      '/appointments',
-      '/admin/doctor/$id/appointments',
-    ];
+  Future<List<Map<String, dynamic>>> _fetchBlocksForDay(String dayKey, String visitMode) async {
+    final res = await Api.get(
+      "/doctors/${widget.doctorId}/blocks",
+      query: {
+        "day": dayKey,
+        "visit_mode": visitMode,
+      },
+    );
 
-    dynamic res;
-    for (final u in urls) {
-      try {
-        res = await Api.get(u, query: {
-          'doctor_id': id,
-          'from': _from.toIso8601String(),
-          'to': _to.toIso8601String(),
-          if (_modeFilter != 'all') 'visit_mode': _modeFilter,
-          if (_modeFilter != 'all') 'mode': _modeFilter,
-        });
-        if (res != null) break;
-      } catch (_) {}
-    }
-
-    var rows = <Map<String, dynamic>>[];
     if (res is List) {
-      rows = res.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-    } else if (res is Map && res['items'] is List) {
-      rows = (res['items'] as List)
-          .map((e) => Map<String, dynamic>.from(e as Map))
-          .toList();
+      // Each block expected: { "start": "...", "end": "...", ... }
+      // We'll inject mode into each row so UI can show it
+      return res.map((e) {
+        final m = Map<String, dynamic>.from(e as Map);
+        m["_mode"] = visitMode;
+        return m;
+      }).toList();
     }
-
-    _appts = rows
-        .where((a) {
-          DateTime? st;
-          final v = a['start_time'];
-          if (v is String) st = DateTime.tryParse(v);
-          if (v is DateTime) st = v;
-          if (st == null) return false;
-          return st.isAfter(_from.subtract(const Duration(seconds: 1))) &&
-              st.isBefore(_to.add(const Duration(seconds: 1)));
-        })
-        .toList()
-      ..sort((a, b) {
-        final A = DateTime.tryParse('${a['start_time']}') ?? DateTime(1970);
-        final B = DateTime.tryParse('${b['start_time']}') ?? DateTime(1970);
-        return A.compareTo(B);
-      });
+    return [];
   }
 
   void _prevWeek() {
     setState(() {
-      _from = _from.subtract(const Duration(days: 7));
-      _to = _to.subtract(const Duration(days: 7));
-      loadingWeek = true;
+      weekStart = weekStart.subtract(const Duration(days: 7));
     });
-    _load();
+    _loadWeek();
   }
 
   void _nextWeek() {
     setState(() {
-      _from = _from.add(const Duration(days: 7));
-      _to = _to.add(const Duration(days: 7));
-      loadingWeek = true;
+      weekStart = weekStart.add(const Duration(days: 7));
+    });
+    _loadWeek();
+  }
+
+  String _fmtDayHeader(DateTime d) {
+    return DateFormat("EEE, MMM d").format(d);
+  }
+
+  String _fmtTimeRange(DateTime start, DateTime end) {
+    return "${DateFormat("h:mm a").format(start)} → ${DateFormat("h:mm a").format(end)}";
+  }
+
+  IconData _modeIcon(String mode) {
+    if (mode == "online") return Icons.wifi;
+    if (mode == "offline") return Icons.local_hospital;
+    return Icons.help_outline;
+  }
+
+  String _modeLabel(String mode) {
+    if (mode == "online") return "Online";
+    if (mode == "offline") return "Offline";
+    return "—";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final days = _daysOfWeek();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("Dr. ${widget.doctorName}"),
+        actions: [
+          IconButton(
+            tooltip: "Refresh",
+            onPressed: _loadWeek,
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // header controls
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            child: Row(
+              children: [
+                IconButton(
+                  tooltip: "Previous 7 days",
+                  onPressed: loading ? null : _prevWeek,
+                  icon: const Icon(Icons.chevron_left),
+                ),
+                Expanded(
+                  child: Text(
+                    "${DateFormat.yMMMd().format(days.first)}  →  ${DateFormat.yMMMd().format(days.last)}",
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                IconButton(
+                  tooltip: "Next 7 days",
+                  onPressed: loading ? null : _nextWeek,
+                  icon: const Icon(Icons.chevron_right),
+                ),
+              ],
+            ),
+          ),
+
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: modeFilter,
+                    decoration: const InputDecoration(
+                      labelText: "Filter",
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: "all", child: Text("All")),
+                      DropdownMenuItem(value: "online", child: Text("Online")),
+                      DropdownMenuItem(value: "offline", child: Text("Offline")),
+                    ],
+                    onChanged: loading
+                        ? null
+                        : (v) {
+                            if (v == null) return;
+                            setState(() => modeFilter = v);
+                            _loadWeek();
+                          },
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          if (loading) const LinearProgressIndicator(),
+
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
+              itemCount: days.length,
+              itemBuilder: (context, i) {
+                final d = days[i];
+                final key = _dayKey(d);
+                final blocks = blocksByDay[key] ?? [];
+
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              _fmtDayHeader(d),
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                            ),
+                            const Spacer(),
+                            Text(
+                              "${blocks.length} slots",
+                              style: TextStyle(color: Colors.grey.shade700, fontWeight: FontWeight.w600),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+
+                        if (blocks.isEmpty)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                            child: Text(
+                              "No available blocks",
+                              style: TextStyle(color: Colors.grey.shade600),
+                            ),
+                          )
+                        else
+                          ...blocks.map((b) {
+                            final start = DateTime.tryParse("${b["start"]}")?.toLocal();
+                            final end = DateTime.tryParse("${b["end"]}")?.toLocal();
+                            final mode = (b["_mode"] ?? b["visit_mode"] ?? "offline").toString().toLowerCase();
+
+                            if (start == null || end == null) return const SizedBox.shrink();
+
+                            return ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: CircleAvatar(
+                                child: Icon(_modeIcon(mode)),
+                              ),
+                              title: Text(
+                                _fmtTimeRange(start, end),
+                                style: const TextStyle(fontWeight: FontWeight.w700),
+                              ),
+                              subtitle: Text("Mode: ${_modeLabel(mode)}"),
+                              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                              onTap: () async {
+                                // Navigate to create appointment with LOCKED mode
+                                final ok = await Navigator.push<bool>(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) => CreateAppointmentPage(
+                                      doctorId: widget.doctorId,
+                                      doctorName: widget.doctorName,
+                                      visitingFee: widget.visitingFee,
+                                      startTime: start,
+                                      endTime: end,
+                                      visitModeLocked: mode, // 🔒 locked
+                                    ),
+                                  ),
+                                );
+
+                                // Refresh if created
+                                if (ok == true && mounted) {
+                                  _loadWeek();
+                                }
+                              },
+                            );
+                          }).toList(),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+class DoctorAvailabilityBody extends StatefulWidget {
+  final int doctorId;
+  final String doctorName;
+  final double? visitingFee;
+
+  const DoctorAvailabilityBody({
+    super.key,
+    required this.doctorId,
+    required this.doctorName,
+    this.visitingFee,
+  });
+
+  @override
+  State<DoctorAvailabilityBody> createState() => _DoctorAvailabilityBodyState();
+}
+
+class _DoctorAvailabilityBodyState extends State<DoctorAvailabilityBody> {
+  bool loading = false;
+
+  DateTime weekStart = DateTime.now();
+  String modeFilter = "all";
+
+  final Map<String, List<Map<String, dynamic>>> blocksByDay = {};
+
+  @override
+  void initState() {
+    super.initState();
+    weekStart = DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day);
+    _loadWeek();
+  }
+
+  String _dayKey(DateTime d) =>
+      "${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}";
+
+  List<DateTime> _daysOfWeek() {
+    return List.generate(7, (i) {
+      final d = weekStart.add(Duration(days: i));
+      return DateTime(d.year, d.month, d.day);
+    });
+  }
+
+  Future<void> _loadWeek() async {
+    setState(() {
+      loading = true;
+      blocksByDay.clear();
+    });
+
+    final days = _daysOfWeek();
+
+    try {
+      for (final d in days) {
+        final key = _dayKey(d);
+
+        if (modeFilter == "all") {
+          final online = await _fetchBlocksForDay(key, "online");
+          final offline = await _fetchBlocksForDay(key, "offline");
+          final merged = [...online, ...offline];
+
+          merged.sort((a, b) {
+            final sa = DateTime.tryParse("${a["start"]}") ?? DateTime(1970);
+            final sb = DateTime.tryParse("${b["start"]}") ?? DateTime(1970);
+            return sa.compareTo(sb);
+          });
+
+          blocksByDay[key] = merged;
+        } else {
+          blocksByDay[key] = await _fetchBlocksForDay(key, modeFilter);
+        }
+      }
+    } catch (e) {
+      if (mounted) showSnack(context, "Failed to load availability: $e");
+    }
+
+    if (mounted) setState(() => loading = false);
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchBlocksForDay(String dayKey, String visitMode) async {
+    final res = await Api.get(
+      "/doctors/${widget.doctorId}/blocks",
+      query: {"day": dayKey, "visit_mode": visitMode},
+    );
+
+    if (res is List) {
+      return res.map((e) {
+        final m = Map<String, dynamic>.from(e as Map);
+        m["_mode"] = visitMode;
+        return m;
+      }).toList();
+    }
+    return [];
+  }
+
+  void _prevWeek() {
+    setState(() => weekStart = weekStart.subtract(const Duration(days: 7)));
+    _loadWeek();
+  }
+
+  void _nextWeek() {
+    setState(() => weekStart = weekStart.add(const Duration(days: 7)));
+    _loadWeek();
+  }
+
+  String _fmtDayHeader(DateTime d) => DateFormat("EEE, MMM d").format(d);
+
+  String _fmtTimeRange(DateTime start, DateTime end) =>
+      "${DateFormat("h:mm a").format(start)} → ${DateFormat("h:mm a").format(end)}";
+
+  IconData _modeIcon(String mode) {
+    if (mode == "online") return Icons.wifi;
+    if (mode == "offline") return Icons.local_hospital;
+    return Icons.help_outline;
+  }
+
+  String _modeLabel(String mode) {
+    if (mode == "online") return "Online";
+    if (mode == "offline") return "Offline";
+    return "—";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final days = _daysOfWeek();
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: "Previous 7 days",
+                onPressed: loading ? null : _prevWeek,
+                icon: const Icon(Icons.chevron_left),
+              ),
+              Expanded(
+                child: Text(
+                  "${DateFormat.yMMMd().format(days.first)}  →  ${DateFormat.yMMMd().format(days.last)}",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+              IconButton(
+                tooltip: "Next 7 days",
+                onPressed: loading ? null : _nextWeek,
+                icon: const Icon(Icons.chevron_right),
+              ),
+            ],
+          ),
+        ),
+
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+          child: DropdownButtonFormField<String>(
+            value: modeFilter,
+            decoration: const InputDecoration(
+              labelText: "Filter",
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            items: const [
+              DropdownMenuItem(value: "all", child: Text("All")),
+              DropdownMenuItem(value: "online", child: Text("Online")),
+              DropdownMenuItem(value: "offline", child: Text("Offline")),
+            ],
+            onChanged: loading
+                ? null
+                : (v) {
+                    if (v == null) return;
+                    setState(() => modeFilter = v);
+                    _loadWeek();
+                  },
+          ),
+        ),
+
+        if (loading) const LinearProgressIndicator(),
+
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
+            itemCount: days.length,
+            itemBuilder: (context, i) {
+              final d = days[i];
+              final key = _dayKey(d);
+              final blocks = blocksByDay[key] ?? [];
+
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            _fmtDayHeader(d),
+                            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+                          ),
+                          const Spacer(),
+                          Text(
+                            "${blocks.length} slots",
+                            style: TextStyle(
+                              color: Colors.grey.shade700,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+
+                      if (blocks.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          child: Text(
+                            "No available blocks",
+                            style: TextStyle(color: Colors.grey.shade600),
+                          ),
+                        )
+                      else
+                        ...blocks.map((b) {
+                          final start = DateTime.tryParse("${b["start"]}")?.toLocal();
+                          final end = DateTime.tryParse("${b["end"]}")?.toLocal();
+                          final mode = (b["_mode"] ?? b["visit_mode"] ?? "offline")
+                              .toString()
+                              .toLowerCase();
+
+                          if (start == null || end == null) return const SizedBox.shrink();
+
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: CircleAvatar(child: Icon(_modeIcon(mode))),
+                            title: Text(
+                              _fmtTimeRange(start, end),
+                              style: const TextStyle(fontWeight: FontWeight.w700),
+                            ),
+                            subtitle: Text("Mode: ${_modeLabel(mode)}"),
+                            trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                            onTap: () async {
+                              final ok = await Navigator.push<bool>(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => CreateAppointmentPage(
+                                    doctorId: widget.doctorId,
+                                    doctorName: widget.doctorName,
+                                    visitingFee: widget.visitingFee,
+                                    startTime: start,
+                                    endTime: end,
+                                    visitModeLocked: mode,
+                                  ),
+                                ),
+                              );
+
+                              if (ok == true && mounted) _loadWeek();
+                            },
+                          );
+                        }).toList(),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class DoctorScheduleAppointmentsBody extends StatefulWidget {
+  const DoctorScheduleAppointmentsBody({
+    super.key,
+    required this.doctorId,
+    required this.doctorName,
+  });
+
+  final int doctorId;
+  final String doctorName;
+
+  @override
+  State<DoctorScheduleAppointmentsBody> createState() =>
+      _DoctorScheduleAppointmentsBodyState();
+}
+
+class _DoctorScheduleAppointmentsBodyState
+    extends State<DoctorScheduleAppointmentsBody> {
+  final dfDay = DateFormat('MMM d, yyyy');
+  final dfTime = DateFormat('h:mm a');
+
+  // 7-day window
+  late DateTime windowStart;
+  late DateTime windowEnd;
+
+  bool loading = false;
+
+  // filter: all/online/offline
+  String modeFilter = 'all';
+
+  // appointments
+  List<Map<String, dynamic>> appts = [];
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    windowStart = DateTime(now.year, now.month, now.day);
+    windowEnd = windowStart.add(const Duration(days: 6));
+    _load();
+  }
+
+  DateTime? _parseDate(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v;
+    if (v is String) return DateTime.tryParse(v);
+    if (v is int) {
+      if (v < 10000000000) return DateTime.fromMillisecondsSinceEpoch(v * 1000);
+      return DateTime.fromMillisecondsSinceEpoch(v);
+    }
+    if (v is double) {
+      final n = v.toInt();
+      if (n < 10000000000) return DateTime.fromMillisecondsSinceEpoch(n * 1000);
+      return DateTime.fromMillisecondsSinceEpoch(n);
+    }
+    return null;
+  }
+
+  int _apptId(Map<String, dynamic> a) {
+    final idDyn = a['id'];
+    return (idDyn is num) ? idDyn.toInt() : int.tryParse('$idDyn') ?? 0;
+  }
+
+  String _modeOf(Map<String, dynamic> a) {
+    final vm = (a['visit_mode'] ?? a['visitMode'] ?? a['mode'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    if (vm.contains('online')) return 'online';
+    if (vm.contains('offline')) return 'offline';
+    return vm.isEmpty ? 'unknown' : vm;
+  }
+
+  IconData _modeIcon(String mode) {
+    switch (mode) {
+      case 'online':
+        return Icons.wifi;
+      case 'offline':
+        return Icons.local_hospital;
+      default:
+        return Icons.help_outline;
+    }
+  }
+
+  String _modeLabel(String mode) {
+    switch (mode) {
+      case 'online':
+        return 'Online';
+      case 'offline':
+        return 'Offline';
+      default:
+        return '—';
+    }
+  }
+
+  Color _chipBg(String t, {String tone = 'status'}) {
+    final s = t.toLowerCase();
+    if (tone == 'pay') return Colors.blue.withOpacity(.12);
+
+    if (s.contains('requested') || s.contains('pending') || s.contains('unapproved')) {
+      return Colors.orange.withOpacity(.18);
+    }
+    if (s.contains('approved') || s.contains('paid')) {
+      return Colors.green.withOpacity(.16);
+    }
+    if (s.contains('cancel') || s.contains('reject')) {
+      return Colors.red.withOpacity(.16);
+    }
+    return Colors.grey.withOpacity(.18);
+  }
+
+  Color _chipFg(String t, {String tone = 'status'}) {
+    final s = t.toLowerCase();
+    if (tone == 'pay') return Colors.blue.shade800;
+
+    if (s.contains('requested') || s.contains('pending') || s.contains('unapproved')) {
+      return Colors.orange.shade900;
+    }
+    if (s.contains('approved') || s.contains('paid')) {
+      return Colors.green.shade800;
+    }
+    if (s.contains('cancel') || s.contains('reject')) {
+      return Colors.red.shade800;
+    }
+    return Colors.grey.shade800;
+  }
+
+  Widget _pill(String text, {Color? bg, Color? fg, IconData? icon}) {
+    final b = bg ?? Colors.grey.withOpacity(.15);
+    final f = fg ?? Colors.grey.shade900;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: b,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 15, color: f),
+            const SizedBox(width: 6),
+          ],
+          Text(
+            text,
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              color: f,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _load() async {
+    setState(() => loading = true);
+
+    try {
+      final res = await Api.get('/admin/appointments');
+      final list = (res as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+
+      final start = DateTime(windowStart.year, windowStart.month, windowStart.day);
+      final end = DateTime(windowEnd.year, windowEnd.month, windowEnd.day, 23, 59, 59);
+
+      final filtered = list.where((a) {
+        // doctor id match
+        final did = a['doctor_id'] ?? a['doctorId'];
+        final docId = (did is num) ? did.toInt() : int.tryParse('$did') ?? -1;
+        if (docId != widget.doctorId) return false;
+
+        // date window match
+        final st = _parseDate(a['start_time']);
+        if (st == null) return false;
+
+        final local = st.toLocal();
+        if (local.isBefore(start) || local.isAfter(end)) return false;
+
+        // mode filter match
+        final mode = _modeOf(a);
+        if (modeFilter == 'online' && mode != 'online') return false;
+        if (modeFilter == 'offline' && mode != 'offline') return false;
+
+        return true;
+      }).toList();
+
+      // sort by start asc (timeline)
+      filtered.sort((a, b) {
+        final sa = _parseDate(a['start_time']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final sb = _parseDate(b['start_time']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return sa.compareTo(sb);
+      });
+
+      appts = filtered;
+    } catch (e) {
+      appts = [];
+      if (mounted) showSnack(context, 'Load failed: $e');
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  void _shiftWindow(int days) {
+    setState(() {
+      windowStart = windowStart.add(Duration(days: days));
+      windowEnd = windowStart.add(const Duration(days: 6));
     });
     _load();
   }
 
   @override
   Widget build(BuildContext context) {
-    final title =
-        '${dfDate.format(_from)}  →  ${dfDate.format(_to.subtract(const Duration(days: 1)))}';
+    final rangeLabel =
+        '${dfDay.format(windowStart)}  →  ${dfDay.format(windowEnd)}';
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Doctor Availability'),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: loadingWeek ? null : _load,
-            icon: const Icon(Icons.refresh),
+    return Column(
+      children: [
+        // HEADER BAR (range + arrows)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: 'Previous',
+                onPressed: loading ? null : () => _shiftWindow(-7),
+                icon: const Icon(Icons.chevron_left),
+              ),
+              Expanded(
+                child: Center(
+                  child: Text(
+                    rangeLabel,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Next',
+                onPressed: loading ? null : () => _shiftWindow(7),
+                icon: const Icon(Icons.chevron_right),
+              ),
+            ],
           ),
-        ],
-      ),
-      body: loading
-          ? const Center(child: CircularProgressIndicator())
-          : Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                  child: Row(
-                    children: [
-                      IconButton(
-                          onPressed: loadingWeek ? null : _prevWeek,
-                          icon: const Icon(Icons.chevron_left)),
-                      Expanded(
-                        child: Text(
-                          title,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                      ),
-                      IconButton(
-                          onPressed: loadingWeek ? null : _nextWeek,
-                          icon: const Icon(Icons.chevron_right)),
-                    ],
-                  ),
-                ),
-                Column(
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
-                      child: SegmentedButton<int>(
-                        segments: const [
-                          ButtonSegment(
-                            value: 0,
-                            icon: Icon(Icons.event_available),
-                            label: Text('Availability'),
-                          ),
-                          ButtonSegment(
-                            value: 1,
-                            icon: Icon(Icons.event_note),
-                            label: Text('Appointments'),
-                          ),
-                        ],
-                        selected: {_tabIndex},
-                        onSelectionChanged: (s) =>
-                            setState(() => _tabIndex = s.first),
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-                      child: SegmentedButton<String>(
-                        segments: const [
-                          ButtonSegment(value: 'all', label: Text('All')),
-                          ButtonSegment(value: 'online', label: Text('Online')),
-                          ButtonSegment(
-                              value: 'offline', label: Text('Offline')),
-                        ],
-                        selected: {_modeFilter},
-                        onSelectionChanged: (s) {
-                          setState(() => _modeFilter = s.first);
-                          _load();
-                        },
-                      ),
-                    ),
+        ),
+
+        // MODE FILTER (All / Online / Offline)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'all', label: Text('All')),
+              ButtonSegment(value: 'online', label: Text('Online')),
+              ButtonSegment(value: 'offline', label: Text('Offline')),
+            ],
+            selected: {modeFilter},
+            onSelectionChanged: (s) {
+              setState(() => modeFilter = s.first);
+              _load();
+            },
+          ),
+        ),
+
+        if (loading) const LinearProgressIndicator(),
+
+        Expanded(
+          child: (!loading && appts.isEmpty)
+              ? ListView(
+                  padding: const EdgeInsets.all(20),
+                  children: const [
+                    SizedBox(height: 120),
+                    Center(child: Text('No appointments found')),
                   ],
-                ),
-                const SizedBox(height: 4),
-                Expanded(
-                  child: RefreshIndicator(
-                    onRefresh: _load,
-                    child: _tabIndex == 0
-                        ? _buildAvailabilityList()
-                        : _buildAppointmentsList(),
-                  ),
-                ),
-              ],
-            ),
-    );
-  }
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                  itemCount: appts.length,
+                  itemBuilder: (ctx, i) {
+                    final a = appts[i];
 
-  Widget _buildAvailabilityList() {
-    if (_slotsByDay.isEmpty) {
-      return ListView(
-        children: const [
-          SizedBox(height: 220),
-          Center(child: Text('No available slots in this window')),
-        ],
-      );
-    }
+                    final apptId = _apptId(a);
+                    final st = _parseDate(a['start_time'])?.toLocal();
+                    final en = _parseDate(a['end_time'])?.toLocal();
 
-    final days = _slotsByDay.keys.toList()..sort();
-    return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      itemCount: days.length,
-      itemBuilder: (ctx, i) {
-        final day = days[i];
-        final slots = _slotsByDay[day]!;
-        return Card(
-          margin: const EdgeInsets.symmetric(vertical: 6),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(dfDate.format(day),
-                    style: const TextStyle(fontWeight: FontWeight.w700)),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: slots.map<Widget>((slot) {
-                    final mode = slot.mode;
+                    final when = [
+                      if (st != null) '${dfDay.format(st)} ${dfTime.format(st)}',
+                      if (en != null) '→ ${dfDay.format(en)} ${dfTime.format(en)}',
+                    ].join('  ');
 
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(999),
-                        color: Theme.of(context)
-                            .colorScheme
-                            .primary
-                            .withOpacity(.10),
+                    final status = (a['status'] ?? '').toString();
+                    final payment = (a['payment_status'] ?? '').toString();
+                    final mode = _modeOf(a);
+
+                    return Card(
+                      elevation: 0,
+                      color: Colors.grey.withOpacity(.06),
+                      margin: const EdgeInsets.symmetric(vertical: 6),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
                       ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(_modeIcon(mode), size: 16),
-                          const SizedBox(width: 6),
-                          Text(
-                              '${dfTime.format(slot.start)} – ${dfTime.format(slot.end)}'),
-                        ],
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(14),
+                        onTap: apptId <= 0
+                            ? null
+                            : () {
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) =>
+                                        AppointmentDetailPage(apptId: apptId),
+                                  ),
+                                );
+                              },
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Appointment #$apptId',
+                                style:
+                                    const TextStyle(fontWeight: FontWeight.w800),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                when,
+                                style: TextStyle(color: Colors.grey.shade800),
+                              ),
+                              const SizedBox(height: 10),
+                              Wrap(
+                                spacing: 10,
+                                runSpacing: 10,
+                                children: [
+                                  _pill(
+                                    _modeLabel(mode),
+                                    icon: _modeIcon(mode),
+                                  ),
+                                  _pill(
+                                    'Status: ${status.isEmpty ? "—" : status}',
+                                    bg: _chipBg(status),
+                                    fg: _chipFg(status),
+                                  ),
+                                  if (payment.isNotEmpty)
+                                    _pill(
+                                      'Payment: $payment',
+                                      bg: _chipBg(payment, tone: 'pay'),
+                                      fg: _chipFg(payment, tone: 'pay'),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     );
-                  }).toList(),
+                  },
                 ),
-              ],
-            ),
-          ),
-        );
-      },
+        ),
+      ],
     );
   }
+}
 
-  Widget _buildAppointmentsList() {
-    if (_appts.isEmpty) {
-      return ListView(
-        children: const [
-          SizedBox(height: 220),
-          Center(child: Text('No appointments in this window')),
-        ],
-      );
+
+/// ---------------------------------------------------------------------------
+/// CreateAppointmentPage
+/// ---------------------------------------------------------------------------
+class CreateAppointmentPage extends StatefulWidget {
+  final int doctorId;
+  final String doctorName;
+  final double? visitingFee;
+
+  final DateTime startTime;
+  final DateTime endTime;
+
+  /// locked visit mode (online/offline)
+  final String visitModeLocked;
+
+  const CreateAppointmentPage({
+    super.key,
+    required this.doctorId,
+    required this.doctorName,
+    this.visitingFee,
+    required this.startTime,
+    required this.endTime,
+    required this.visitModeLocked,
+  });
+
+  @override
+  State<CreateAppointmentPage> createState() => _CreateAppointmentPageState();
+}
+
+class _CreateAppointmentPageState extends State<CreateAppointmentPage> {
+  // Existing patient search
+  final phoneCtrl = TextEditingController();
+  final patientIdCtrl = TextEditingController();
+
+  bool finding = false;
+  bool creating = false;
+
+  bool foundPatient = false;
+  int? foundPatientId;
+
+  // New patient toggle
+  bool createNewPatient = false;
+
+  // New patient required fields
+  final newPhoneCtrl = TextEditingController();
+  final newEmailCtrl = TextEditingController();
+  final newPasswordCtrl = TextEditingController(); // optional now
+
+  // Patient info (shared)
+  final nameCtrl = TextEditingController();
+  final ageCtrl = TextEditingController();
+  final heightCtrl = TextEditingController();
+  final weightCtrl = TextEditingController();
+  final bloodCtrl = TextEditingController();
+  final genderCtrl = TextEditingController();
+  final addressCtrl = TextEditingController();
+
+  // Payment (same for existing & new)
+  String paymentStatus = "pending"; // pending/paid
+  String paymentMethod = "Cash"; // bKash/Rocket/Card/Cash/Bank Transfer/Other
+  final txCtrl = TextEditingController();
+  final amountCtrl = TextEditingController();
+
+  @override
+  void dispose() {
+    phoneCtrl.dispose();
+    patientIdCtrl.dispose();
+
+    newPhoneCtrl.dispose();
+    newEmailCtrl.dispose();
+    newPasswordCtrl.dispose();
+
+    nameCtrl.dispose();
+    ageCtrl.dispose();
+    heightCtrl.dispose();
+    weightCtrl.dispose();
+    bloodCtrl.dispose();
+    genderCtrl.dispose();
+    addressCtrl.dispose();
+
+    txCtrl.dispose();
+    amountCtrl.dispose();
+
+    super.dispose();
+  }
+
+  String _fmt(DateTime dt) => DateFormat("MMM d, yyyy  h:mm a").format(dt);
+
+  int? _tryInt(String s) {
+    final v = s.trim();
+    if (v.isEmpty) return null;
+    return int.tryParse(v);
+  }
+
+  double? _tryDouble(String s) {
+    final v = s.trim();
+    if (v.isEmpty) return null;
+    return double.tryParse(v);
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _findPatient() async {
+    setState(() {
+      finding = true;
+      foundPatient = false;
+      foundPatientId = null;
+    });
+
+    final phone = phoneCtrl.text.trim();
+    final pid = patientIdCtrl.text.trim();
+
+    if (phone.isEmpty && pid.isEmpty) {
+      _toast("Enter phone or patient ID");
+      setState(() => finding = false);
+      return;
     }
 
-    final df = DateFormat.yMMMd().add_jm();
-    return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      itemCount: _appts.length,
-      itemBuilder: (ctx, i) {
-        final a = _appts[i];
-        final id = a['id'];
+    try {
+      final res = await Api.get(
+        "/admin/patients/find",
+        query: {
+          if (phone.isNotEmpty) "phone": phone,
+          if (pid.isNotEmpty) "patient_id": pid,
+        },
+      );
 
-        DateTime? s, e;
-        final st = a['start_time'];
-        final en = a['end_time'];
-        if (st is String) s = DateTime.tryParse(st);
-        if (st is DateTime) s = st;
-        if (en is String) e = DateTime.tryParse(en);
-        if (en is DateTime) e = en;
+      if (res is! Map || res["found"] != true) {
+        _toast("No patient found");
+        setState(() => finding = false);
+        return;
+      }
 
-        final when = [
-          if (s != null) df.format(s.toLocal()),
-          if (e != null) '→ ${df.format(e.toLocal())}',
-        ].join(' ');
+      foundPatient = true;
+      foundPatientId = (res["patient_id"] is num) ? (res["patient_id"] as num).toInt() : int.tryParse("${res["patient_id"]}");
 
-        final status = (a['status'] ?? '').toString();
-        final pay = (a['payment_status'] ?? '').toString();
-        final mode = _modeOf(a);
+      // Fill patient info (existing)
+      nameCtrl.text = (res["name"] ?? "").toString();
+      ageCtrl.text = (res["age"] ?? "").toString();
+      heightCtrl.text = (res["height"] ?? "").toString();
+      weightCtrl.text = (res["weight"] ?? "").toString();
+      bloodCtrl.text = (res["blood_group"] ?? "").toString();
+      genderCtrl.text = (res["gender"] ?? "").toString();
+      addressCtrl.text = (res["address"] ?? "").toString();
 
-        final pat = a['patient'];
-        final patientName =
-            (pat is Map && pat['name'] != null) ? '${pat['name']}' : '';
+      _toast("Patient found: ${res["name"]}");
+    } catch (e) {
+      _toast("Find failed: $e");
+    }
 
-        return Card(
-          margin: const EdgeInsets.symmetric(vertical: 6),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: () {
-              final apptId = (id is num) ? id.toInt() : int.tryParse('$id');
-              if (apptId != null) {
-                Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => AppointmentDetailPage(apptId: apptId),
-                ));
-              }
-            },
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text('Appointment #$id',
-                      style: const TextStyle(fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 2),
-                  Text(
-                    [
-                      if (patientName.isNotEmpty) patientName,
-                      if (when.isNotEmpty) when
-                    ].join(' • '),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
+    setState(() => finding = false);
+  }
+
+  Future<void> _createAppointment() async {
+    if (!createNewPatient) {
+      if (foundPatientId == null) {
+        _toast("Please find and select an existing patient first");
+        return;
+      }
+      await _createForExisting();
+    } else {
+      await _createForNew();
+    }
+  }
+
+  Future<int?> _recordPaymentIfNeeded(int apptId) async {
+    // Only record payment if status is paid OR method/tx/amount filled
+    final wantPaid = paymentStatus == "paid";
+    final method = paymentMethod.trim();
+    final tx = txCtrl.text.trim();
+    final amount = _tryDouble(amountCtrl.text);
+
+    final hasAnyPaymentField = wantPaid || tx.isNotEmpty || (amount != null);
+
+    if (!hasAnyPaymentField) return apptId;
+
+    // Your backend "approve" endpoint can create payment rows if method provided.
+    // Appointment is already approved, but calling approve again is OK (it just updates).
+    try {
+      await Api.patch(
+        "/admin/appointments/$apptId/approve",
+        data: {
+          "approve": true,
+          "method": method, // required to create payment
+          "transaction_id": tx.isEmpty ? null : tx,
+          "amount": amount,
+        },
+      );
+      return apptId;
+    } catch (e) {
+      _toast("Payment record failed: $e");
+      return apptId; // still return appointment created
+    }
+  }
+
+  Future<void> _createForExisting() async {
+    setState(() => creating = true);
+
+    try {
+      final res = await Api.post(
+        "/admin/appointments/create_by_staff",
+        data: {
+          "doctor_id": widget.doctorId,
+          "patient_id": foundPatientId,
+          "start_time": widget.startTime.toIso8601String(),
+          "end_time": widget.endTime.toIso8601String(),
+          "visit_mode": widget.visitModeLocked, // 🔒 locked mode
+          "patient_problem": "",
+        },
+      );
+
+      if (res is Map) {
+        final idDyn = res["id"];
+        final apptId = (idDyn is num) ? idDyn.toInt() : int.tryParse("$idDyn");
+
+        if (apptId != null) {
+          await _recordPaymentIfNeeded(apptId);
+          _toast("Appointment created! ID: $apptId");
+          if (mounted) Navigator.pop(context, true);
+          return;
+        }
+      }
+
+      _toast("Appointment created but could not read ID");
+    } catch (e) {
+      _toast("Create failed: $e");
+    }
+
+    setState(() => creating = false);
+  }
+
+  Future<void> _createForNew() async {
+    setState(() => creating = true);
+
+    final phone = newPhoneCtrl.text.trim();
+    final email = newEmailCtrl.text.trim();
+    final pass = newPasswordCtrl.text.trim();
+
+    if (nameCtrl.text.trim().isEmpty || phone.isEmpty) {
+      _toast("New patient requires Name and Phone");
+      setState(() => creating = false);
+      return;
+    }
+
+    // PASSWORD OPTIONAL:
+    // Backend requires "password" (string), so if user leaves empty we auto-generate one.
+    final finalPassword = pass.isNotEmpty ? pass : "P@${phone.length >= 6 ? phone.substring(phone.length - 6) : phone}";
+
+    try {
+      final res = await Api.post(
+        "/admin/appointments/create_new_patient_and_appointment",
+        data: {
+          "name": nameCtrl.text.trim(),
+          "phone": phone,
+          "password": finalPassword, // auto generated if empty
+          "email": email.isEmpty ? null : email,
+
+          "age": _tryInt(ageCtrl.text),
+          "height": _tryInt(heightCtrl.text),
+          "weight": _tryInt(weightCtrl.text),
+          "blood_group": bloodCtrl.text.trim().isEmpty ? null : bloodCtrl.text.trim(),
+          "gender": genderCtrl.text.trim().isEmpty ? null : genderCtrl.text.trim(),
+          "address": addressCtrl.text.trim().isEmpty ? null : addressCtrl.text.trim(),
+
+          "doctor_id": widget.doctorId,
+          "start_time": widget.startTime.toIso8601String(),
+          "end_time": widget.endTime.toIso8601String(),
+          "visit_mode": widget.visitModeLocked, // 🔒 locked mode
+          "patient_problem": "",
+        },
+      );
+
+      if (res is Map) {
+        final idDyn = res["id"];
+        final apptId = (idDyn is num) ? idDyn.toInt() : int.tryParse("$idDyn");
+
+        if (apptId != null) {
+          await _recordPaymentIfNeeded(apptId);
+
+          _toast("New patient + appointment created! ID: $apptId");
+          if (pass.isEmpty) {
+            _toast("Auto password for new patient: $finalPassword");
+          }
+
+          if (mounted) Navigator.pop(context, true);
+          return;
+        }
+      }
+
+      _toast("Created, but could not read appointment ID");
+    } catch (e) {
+      _toast("Create failed: $e");
+    }
+
+    setState(() => creating = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final slotText = "Slot: ${_fmt(widget.startTime)}  →  ${_fmt(widget.endTime)}";
+    final lockedModeLabel = widget.visitModeLocked.toLowerCase() == "online" ? "Online" : "Offline";
+
+    return Scaffold(
+      appBar: AppBar(title: const Text("Create Appointment")),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text("Doctor: Dr. ${widget.doctorName}",
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+
+            if (widget.visitingFee != null) ...[
+              Text(
+                "Visiting Fee: ৳${widget.visitingFee!.toStringAsFixed(0)}",
+                style: TextStyle(color: Colors.grey.shade800, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
+            ],
+
+            Text(slotText, style: TextStyle(color: Colors.grey.shade700)),
+            const SizedBox(height: 10),
+
+            // MODE LOCKED
+            Row(
+              children: [
+                const Text("Mode:", style: TextStyle(fontWeight: FontWeight.w700)),
+                const SizedBox(width: 10),
+                Chip(
+                  label: Text(lockedModeLabel, style: const TextStyle(fontWeight: FontWeight.w700)),
+                  avatar: Icon(widget.visitModeLocked == "online" ? Icons.wifi : Icons.local_hospital, size: 18),
+                ),
+                const Spacer(),
+                const Icon(Icons.lock, size: 16),
+                const SizedBox(width: 6),
+                Text("Locked", style: TextStyle(color: Colors.grey.shade700, fontWeight: FontWeight.w600)),
+              ],
+            ),
+
+            const Divider(height: 28),
+
+            // NEW PATIENT TOGGLE
+            Row(
+              children: [
+                Switch(
+                  value: createNewPatient,
+                  onChanged: creating
+                      ? null
+                      : (v) {
+                          setState(() {
+                            createNewPatient = v;
+                            foundPatient = false;
+                            foundPatientId = null;
+                          });
+                        },
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  createNewPatient ? "New Patient" : "Existing Patient",
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const Spacer(),
+                if (!createNewPatient)
+                  TextButton.icon(
+                    onPressed: creating ? null : _findPatient,
+                    icon: finding
+                        ? const SizedBox(
+                            height: 16,
+                            width: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.search),
+                    label: const Text("Find Patient"),
                   ),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .primary
-                              .withOpacity(.10),
-                          borderRadius: BorderRadius.circular(24),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(_modeIcon(mode), size: 16),
-                            const SizedBox(width: 6),
-                            Text(_modeLabel(mode),
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.w600)),
-                          ],
-                        ),
+              ],
+            ),
+
+            const SizedBox(height: 10),
+
+            if (!createNewPatient) ...[
+              // EXISTING PATIENT SEARCH UI
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: phoneCtrl,
+                      decoration: const InputDecoration(
+                        labelText: "Phone",
+                        border: OutlineInputBorder(),
                       ),
-                      _pill('Status: $status'),
-                      if (pay.isNotEmpty) _pill('Payment: $pay', color: Colors.blue),
-                    ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: TextField(
+                      controller: patientIdCtrl,
+                      decoration: const InputDecoration(
+                        labelText: "Patient ID",
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.number,
+                    ),
                   ),
                 ],
               ),
-            ),
-          ),
-        );
-      },
-    );
-  }
+              const SizedBox(height: 10),
+              if (foundPatientId != null)
+                Text("Selected Patient ID: $foundPatientId",
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+            ] else ...[
+              // NEW PATIENT FIELDS
+              const Text("New Patient Required Fields", style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 10),
+              TextField(
+                controller: newPhoneCtrl,
+                decoration: const InputDecoration(
+                  labelText: "Phone (required)",
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: newEmailCtrl,
+                decoration: const InputDecoration(
+                  labelText: "Email (optional)",
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: newPasswordCtrl,
+                decoration: const InputDecoration(
+                  labelText: "Password (optional)",
+                  border: OutlineInputBorder(),
+                ),
+                obscureText: true,
+              ),
+            ],
 
-  Widget _pill(String text, {MaterialColor? color}) {
-    final mat = color ?? Colors.green;
-    final bg = mat.withOpacity(.14);
-    final fg = mat.shade800;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration:
-          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(24)),
-      child: Text(text,
-          style: TextStyle(color: fg, fontWeight: FontWeight.w600)),
+            const Divider(height: 28),
+
+            // PATIENT INFO
+            const Text("Patient Info", style: TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 10),
+
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(
+                labelText: "Name",
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: ageCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Age",
+                      border: OutlineInputBorder(),
+                    ),
+                    keyboardType: TextInputType.number,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextField(
+                    controller: heightCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Height",
+                      border: OutlineInputBorder(),
+                    ),
+                    keyboardType: TextInputType.number,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: weightCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Weight",
+                      border: OutlineInputBorder(),
+                    ),
+                    keyboardType: TextInputType.number,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextField(
+                    controller: genderCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Gender",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: bloodCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Blood Group",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextField(
+                    controller: addressCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Address",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const Divider(height: 28),
+
+            // PAYMENT
+            const Text("Payment", style: TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 10),
+
+            DropdownButtonFormField<String>(
+              value: paymentStatus,
+              decoration: const InputDecoration(
+                labelText: "Payment Status",
+                border: OutlineInputBorder(),
+              ),
+              items: const [
+                DropdownMenuItem(value: "pending", child: Text("Unpaid / Pending")),
+                DropdownMenuItem(value: "paid", child: Text("Paid")),
+              ],
+              onChanged: creating ? null : (v) => setState(() => paymentStatus = v ?? "pending"),
+            ),
+            const SizedBox(height: 10),
+
+            DropdownButtonFormField<String>(
+              value: paymentMethod,
+              decoration: const InputDecoration(
+                labelText: "Method",
+                border: OutlineInputBorder(),
+              ),
+              items: const [
+                DropdownMenuItem(value: "bKash", child: Text("bKash")),
+                DropdownMenuItem(value: "Rocket", child: Text("Rocket")),
+                DropdownMenuItem(value: "Card", child: Text("Card")),
+                DropdownMenuItem(value: "Cash", child: Text("Cash")),
+                DropdownMenuItem(value: "Bank Transfer", child: Text("Bank Transfer")),
+                DropdownMenuItem(value: "Other", child: Text("Other")),
+              ],
+              onChanged: creating ? null : (v) => setState(() => paymentMethod = v ?? "Cash"),
+            ),
+            const SizedBox(height: 10),
+
+            TextField(
+              controller: txCtrl,
+              decoration: const InputDecoration(
+                labelText: "Transaction ID (optional for Cash)",
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            TextField(
+              controller: amountCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: "Amount (optional)",
+                border: OutlineInputBorder(),
+              ),
+            ),
+
+            const SizedBox(height: 18),
+
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: ElevatedButton(
+                onPressed: creating ? null : _createAppointment,
+                child: creating
+                    ? const CircularProgressIndicator()
+                    : Text(createNewPatient ? "Create Patient + Appointment" : "Create Appointment"),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

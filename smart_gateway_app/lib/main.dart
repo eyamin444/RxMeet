@@ -658,7 +658,7 @@ class _LoginPageState extends State<LoginPage> {
   Widget build(BuildContext context) {
     final double w = MediaQuery.of(context).size.width.clamp(320.0, 520.0).toDouble();
     return Scaffold(
-      appBar: AppBar(title: const Text('Smart Gateway — Login')),
+      appBar: AppBar(title: const Text('RxMeet')),
       body: Center(
         child: ConstrainedBox(
           constraints: BoxConstraints(maxWidth: w),

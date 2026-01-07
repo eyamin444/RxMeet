@@ -30,9 +30,10 @@ from firebase_admin import messaging
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 from io import BytesIO
 from sqlalchemy import func
-
-
-
+from fastapi import Query
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional, List
 
 # -----------------------------------------------------------------------------
 # Config
@@ -404,6 +405,55 @@ class Message(Base):
 
     # Relationship (optional)
     appointment = relationship("Appointment")
+# ===================== Admin/Staff Create Appointment + Patient Search Schemas =====================
+
+class StaffFindPatientOut(BaseModel):
+    ok: bool = True
+    found: bool
+    patient_id: Optional[int] = None
+    user_id: Optional[int] = None
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    age: Optional[int] = None
+    height: Optional[int] = None
+    weight: Optional[int] = None
+    blood_group: Optional[str] = None
+    gender: Optional[str] = None
+    description: Optional[str] = None
+    medical_history: Optional[str] = None
+    current_medicine: Optional[str] = None
+    address: Optional[str] = None
+
+class StaffCreateExistingPatientAppointmentIn(BaseModel):
+    doctor_id: int
+    patient_id: int
+    start_time: datetime
+    end_time: datetime
+    visit_mode: VisitMode = VisitMode.offline
+    patient_problem: Optional[str] = ""
+
+class StaffCreateNewPatientAppointmentIn(BaseModel):
+    # NEW USER/PATIENT
+    name: str
+    phone: str
+    password: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+    # optional patient profile fields
+    age: Optional[int] = None
+    height: Optional[int] = None
+    weight: Optional[int] = None
+    blood_group: Optional[str] = None
+    gender: Optional[str] = None
+    address: Optional[str] = None
+
+    # APPOINTMENT fields
+    doctor_id: int
+    start_time: datetime
+    end_time: datetime
+    visit_mode: VisitMode = VisitMode.offline
+    patient_problem: Optional[str] = ""
 
 # -----------------------------------------------------------------------------
 # SQLite additive auto-migrations (adds columns safely)
@@ -555,6 +605,55 @@ def fcm_send_data_tokens(db: Session, tokens: List[str], data: dict, ttl_seconds
                 # Log and continue; do not raise to avoid failing the whole call
                 print("FCM send error:", err)
 
+def sqlite_make_users_email_nullable(engine):
+    """
+    SQLite cannot ALTER COLUMN easily.
+    So we rebuild the users table allowing email NULL.
+    """
+    if engine.url.get_backend_name() != "sqlite":
+        return
+
+    with engine.begin() as conn:
+        # check current schema
+        rows = conn.execute(text("PRAGMA table_info(users)")).mappings().all()
+        email_col = next((r for r in rows if r["name"] == "email"), None)
+        if not email_col:
+            return
+
+        # If already nullable -> nothing to do
+        if email_col["notnull"] == 0:
+            return
+
+        print("Migrating users.email to nullable...")
+
+        # 1) rename old table
+        conn.execute(text("ALTER TABLE users RENAME TO users_old"))
+
+        # 2) create new table (email nullable)
+        conn.execute(text("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            email VARCHAR UNIQUE,
+            phone VARCHAR UNIQUE,
+            role VARCHAR NOT NULL,
+            password_hash VARCHAR NOT NULL,
+            created_at DATETIME,
+            photo_path VARCHAR
+        )
+        """))
+
+        # 3) copy data
+        conn.execute(text("""
+        INSERT INTO users (id, name, email, phone, role, password_hash, created_at, photo_path)
+        SELECT id, name, email, phone, role, password_hash, created_at, photo_path
+        FROM users_old
+        """))
+
+        # 4) drop old table
+        conn.execute(text("DROP TABLE users_old"))
+
+        print("   users.email is now nullable.")
 
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> User:
     exc = HTTPException(status_code=401, detail="Could not validate credentials",
@@ -1115,6 +1214,7 @@ def on_startup():
     os.makedirs("uploads", exist_ok=True)
     create_db()
     ensure_sqlite_schema(engine)
+    sqlite_make_users_email_nullable(engine)
 
     # Ensure Firebase is initialized in this process
     ok = ensure_firebase_initialized()
@@ -1309,7 +1409,6 @@ def admin_list_appointments(status_filter: Optional[AppointmentStatus] = None,
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_, func, text  # ensure func/or_ already imported near top
-
 
 @app.patch("/admin/appointments/{appointment_id}/approve", response_model=dict)
 def approve_appointment(appointment_id: int, body: ApproveIn, db: Session = Depends(get_db),
@@ -1648,6 +1747,187 @@ def approve_appointment(appointment_id: int, body: ApproveIn, db: Session = Depe
     }
 
     return resp
+
+# ===================== STAFF/ADMIN: Find Patient + Create Appointment =====================
+
+@app.get("/admin/patients/find", response_model=StaffFindPatientOut)
+def admin_find_patient(
+    phone: Optional[str] = None,
+    patient_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    curr: User = Depends(require_role(UserRole.admin)),
+):
+    """
+    Find patient by phone OR patient_id.
+    Returns full patient profile if found.
+    """
+    if not phone and not patient_id:
+        raise HTTPException(status_code=422, detail="Provide phone or patient_id")
+
+    patient = None
+
+    if patient_id:
+        patient = db.get(Patient, patient_id)
+
+    if not patient and phone:
+        # Normalize phone: keep only digits + leading +
+        ph = str(phone).strip()
+        # Find user by phone first
+        u = db.query(User).filter(User.phone == ph).first()
+        if u:
+            patient = db.query(Patient).filter(Patient.user_id == u.id).first()
+
+    if not patient or not patient.user:
+        return StaffFindPatientOut(found=False)
+
+    # Optional: doctor address is in Doctor table. Patient address isn't stored in Patient schema currently.
+    # You can store address in Patient.description or add address column if needed.
+    return StaffFindPatientOut(
+        found=True,
+        patient_id=patient.id,
+        user_id=patient.user.id,
+        name=patient.user.name,
+        phone=patient.user.phone,
+        email=patient.user.email,
+        age=patient.age,
+        height=patient.height,
+        weight=patient.weight,
+        blood_group=patient.blood_group,
+        gender=patient.gender,
+        description=patient.description,
+        medical_history=patient.medical_history,
+        current_medicine=patient.current_medicine,
+        address="",  # add patient.address column if you want real address
+    )
+
+
+@app.post("/admin/appointments/create_by_staff", response_model=AppointmentOut)
+def admin_create_appointment_existing_patient(
+    payload: StaffCreateExistingPatientAppointmentIn,
+    db: Session = Depends(get_db),
+    curr: User = Depends(require_role(UserRole.admin)),
+):
+    """
+    Create appointment for EXISTING patient.
+    Must pass patient_id.
+    """
+    doctor = db.get(Doctor, payload.doctor_id)
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    patient = db.get(Patient, payload.patient_id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    # Validate slot capacity
+    if slot_capacity_left(db, payload.doctor_id, payload.start_time, payload.end_time) <= 0:
+        raise HTTPException(status_code=400, detail="Selected slot is not available")
+
+    # Optional: validate mode allowed for that doctor on that time (must match schedule mode)
+    rule = _active_rule_for(db, payload.doctor_id, payload.start_time, payload.start_time.hour, payload.end_time.hour)
+    if rule:
+        allowed_mode = (rule.get("mode") or "offline").lower()
+        if payload.visit_mode.value.lower() != allowed_mode:
+            raise HTTPException(status_code=400, detail=f"This slot is {allowed_mode}. You selected {payload.visit_mode.value}.")
+
+    custom_id = generate_appointment_id(db, payload.start_time.date())
+
+    appt = Appointment(
+        id=custom_id,
+        patient_id=patient.id,
+        doctor_id=payload.doctor_id,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        status=AppointmentStatus.approved,        # staff created => approve directly
+        payment_status=PaymentStatus.pending,
+        visit_mode=payload.visit_mode,
+        patient_problem=payload.patient_problem or "",
+        last_modified_by_user_id=curr.id,
+        last_modified_at=datetime.utcnow(),
+    )
+
+    db.add(appt)
+    db.commit()
+    db.refresh(appt)
+    return appt
+
+
+@app.post("/admin/appointments/create_new_patient_and_appointment", response_model=AppointmentOut)
+def admin_create_new_patient_and_appointment(
+    payload: StaffCreateNewPatientAppointmentIn,
+    db: Session = Depends(get_db),
+    curr: User = Depends(require_role(UserRole.admin)),
+):
+    """
+    Create NEW patient + appointment in one shot.
+    """
+    doctor = db.get(Doctor, payload.doctor_id)
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    # Check uniqueness
+    if payload.phone and db.query(User).filter(User.phone == payload.phone).first():
+        raise HTTPException(status_code=400, detail="Phone already registered")
+    if payload.email and db.query(User).filter(User.email == payload.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Validate slot capacity
+    if slot_capacity_left(db, payload.doctor_id, payload.start_time, payload.end_time) <= 0:
+        raise HTTPException(status_code=400, detail="Selected slot is not available")
+
+    # Validate mode allowed (slot mode)
+    rule = _active_rule_for(db, payload.doctor_id, payload.start_time, payload.start_time.hour, payload.end_time.hour)
+    if rule:
+        allowed_mode = (rule.get("mode") or "offline").lower()
+        if payload.visit_mode.value.lower() != allowed_mode:
+            raise HTTPException(status_code=400, detail=f"This slot is {allowed_mode}. You selected {payload.visit_mode.value}.")
+
+    # Create User + Patient
+    u = User(
+        name=payload.name,
+        phone=payload.phone,
+        email=payload.email,
+        role=UserRole.patient,
+        password_hash=hash_password(payload.password),
+    )
+    db.add(u)
+    db.flush()
+
+    p = Patient(
+        user_id=u.id,
+        age=payload.age,
+        height=payload.height,
+        weight=payload.weight,
+        blood_group=payload.blood_group,
+        gender=payload.gender,
+        description="",
+        current_medicine="",
+        medical_history="",
+    )
+    db.add(p)
+    db.flush()
+
+    # Create appointment
+    custom_id = generate_appointment_id(db, payload.start_time.date())
+    appt = Appointment(
+        id=custom_id,
+        patient_id=p.id,
+        doctor_id=payload.doctor_id,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        status=AppointmentStatus.approved,        # staff created => approve directly
+        payment_status=PaymentStatus.pending,
+        visit_mode=payload.visit_mode,
+        patient_problem=payload.patient_problem or "",
+        last_modified_by_user_id=curr.id,
+        last_modified_at=datetime.utcnow(),
+    )
+
+    db.add(appt)
+    db.commit()
+    db.refresh(appt)
+    return appt
+
 
 # ------------------ New admin payments listing endpoint ------------------
 @app.get("/admin/payments", response_model=dict)
@@ -2425,11 +2705,11 @@ def request_appointment(payload: AppointmentIn, db: Session = Depends(get_db),
     if slot_capacity_left(db, payload.doctor_id, payload.start_time, payload.end_time) <= 0:
         raise HTTPException(400, "Selected slot is not available")
 
-    # ✅ Generate custom id (globally per day)
+    #    Generate custom id (globally per day)
     custom_id = generate_appointment_id(db, payload.start_time.date())
 
     appt = Appointment(
-        id=custom_id,  # ✅ THIS MAKES id like 202601050001
+        id=custom_id,  #    THIS MAKES id like 202601050001
         patient_id=p.id,
         doctor_id=payload.doctor_id,
         start_time=payload.start_time,
@@ -2474,7 +2754,7 @@ def request_appointment_multipart(
         with open(path, "wb") as f:
             f.write(disease_photo.file.read())
 
-    # ✅ Generate custom id (globally per day) ALWAYS
+    #    Generate custom id (globally per day) ALWAYS
     custom_id = generate_appointment_id(db, st.date())
 
     appt = Appointment(

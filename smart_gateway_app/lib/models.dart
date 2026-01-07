@@ -139,7 +139,7 @@ class Doctor {
       rating: (j['rating'] ?? 0).toInt(),
       photoPath: j['photo_path'],
 
-      // ✅ NEW (from /doctors/browse)
+      //    NEW (from /doctors/browse)
       nextOnline: parseDate(j['next_online']),
       nextOffline: parseDate(j['next_offline']),
       hasOnline: j['has_online'] == true,

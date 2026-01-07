@@ -58,7 +58,7 @@ class Api {
   static Future<void> _ensureReady() async {
     if (!_ready) await init();
   }
-// ✅ Multipart helper (authenticated because _dio has interceptor)
+//    Multipart helper (authenticated because _dio has interceptor)
 static Future<dynamic> postMultipart(String path, {required FormData formData}) async {
   await _ensureReady();
 
